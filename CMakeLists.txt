@@ -25,6 +25,7 @@ include(FetchContent)
 
 if(NOT TARGET nlohmann_json::nlohmann_json)
   set(JSON_BuildTests OFF CACHE INTERNAL "")
+  set(JSON_Install OFF CACHE INTERNAL "")
   FetchContent_Declare(nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
     GIT_TAG        v3.11.3
@@ -35,10 +36,22 @@ endif()
 
 # HTTPS out to the providers. OpenSSL must be installed and findable; on
 # Windows point CMake at it with -DOPENSSL_ROOT_DIR=C:/path/to/openssl.
+#
+# -DLIBTAPTO_STATIC_SSL=ON links OpenSSL and zlib statically where a static
+# build of them exists. Strawberry Perl's MinGW ships import libraries only
+# (its libcrypto.a is all __imp_ stubs), so on that toolchain this stays off
+# and the installer ships the DLLs instead, found by file(GET_RUNTIME_DEPENDENCIES).
+option(LIBTAPTO_STATIC_SSL "Link OpenSSL (and zlib) statically" OFF)
+if(LIBTAPTO_STATIC_SSL)
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+endif()
 find_package(OpenSSL REQUIRED)
 
 if(NOT TARGET httplib::httplib)
   set(HTTPLIB_REQUIRE_OPENSSL ON CACHE INTERNAL "")
+  # Header-only and private to us: its install rules would otherwise put
+  # httplib.h and a cmake package into every consumer's install tree.
+  set(HTTPLIB_INSTALL OFF CACHE INTERNAL "")
   FetchContent_Declare(httplib
     GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
     GIT_TAG        v0.15.3
@@ -97,9 +110,21 @@ endif()
 # and picks up whichever copy it finds first -- a different GCC's, on a machine
 # with Git Bash installed, which fails with STATUS_ENTRYPOINT_NOT_FOUND. Every
 # program linking this library inherits the flags, so a Release directory can
-# be moved and run as it is.
+# be moved and run as it is. With static OpenSSL the whole runtime goes static
+# (winpthread included) and the executable depends on system DLLs only.
 if(MINGW)
-  target_link_options(tapto PUBLIC -static-libgcc -static-libstdc++)
+  if(LIBTAPTO_STATIC_SSL)
+    target_link_options(tapto PUBLIC -static)
+    # Static OpenSSL was built against zlib and pulls in the Windows crypto
+    # and socket APIs itself.
+    find_library(ZLIB_STATIC NAMES libz.a z)
+    if(ZLIB_STATIC)
+      target_link_libraries(tapto PUBLIC ${ZLIB_STATIC})
+    endif()
+    target_link_libraries(tapto PUBLIC ws2_32 crypt32)
+  else()
+    target_link_options(tapto PUBLIC -static-libgcc -static-libstdc++)
+  endif()
 endif()
 
 # --- Tests ------------------------------------------------------------------
