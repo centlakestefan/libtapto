@@ -22,8 +22,6 @@ private:
     using ToolExecutor = std::function<std::string(const nlohmann::json&)>;
 
     // API timeout constants (in seconds)
-    static constexpr int CONNECTION_TIMEOUT_SECONDS = 30;
-    static constexpr int READ_TIMEOUT_SECONDS = 300;
 
     // Retry limit constants
     static constexpr int MAX_CONNECTION_RETRIES = 5;

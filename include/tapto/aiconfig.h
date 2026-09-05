@@ -11,6 +11,9 @@ class AiConfig {
 public:
     int maxOutputTokens() const { return m_maxOutputTokens; }
     int maxToolIterations() const { return m_maxToolIterations; }
+    int connectionTimeoutSeconds() const { return m_connectionTimeoutSeconds; }
+    int readTimeoutSeconds() const { return m_readTimeoutSeconds; }
+    // Older names; the timeouts apply to every dialect, not just openai.
     int openaiConnectionTimeoutSeconds() const { return m_connectionTimeoutSeconds; }
     int openaiReadTimeoutSeconds() const { return m_readTimeoutSeconds; }
     const std::string& effort() const { return m_effort; }
@@ -20,6 +23,8 @@ public:
 
     void setMaxOutputTokens(int v) { m_maxOutputTokens = v; }
     void setMaxToolIterations(int v) { m_maxToolIterations = v; }
+    void setConnectionTimeoutSeconds(int v) { m_connectionTimeoutSeconds = v; }
+    void setReadTimeoutSeconds(int v) { m_readTimeoutSeconds = v; }
     void setOpenaiConnectionTimeoutSeconds(int v) { m_connectionTimeoutSeconds = v; }
     void setOpenaiReadTimeoutSeconds(int v) { m_readTimeoutSeconds = v; }
     void setEffort(std::string v) { m_effort = std::move(v); }
@@ -31,6 +36,15 @@ private:
     int m_maxOutputTokens = 16000;
     int m_maxToolIterations = 200;
     int m_connectionTimeoutSeconds = 30;
+
+    // How long to wait for the provider's answer. The response is not streamed,
+    // so this is the whole generation: a 16k-token answer from a local model
+    // decoding at 14 tok/s takes nineteen minutes and arrives all at once at
+    // the end. A timeout shorter than the generation does not just fail the
+    // turn -- the retry re-sends the same request, the server cancels the
+    // work in progress, and the cycle repeats until the retry budget is spent,
+    // which is the worst of every world. Programs set this from config
+    // (read-timeout); the default is for a hosted provider.
     int m_readTimeoutSeconds = 300;
 
     // Claude's thinking depth and overall token spend, sent as

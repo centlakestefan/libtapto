@@ -37,8 +37,8 @@ void ClaudeClient::init_api_client() {
         m_api_client->enable_server_certificate_verification(true);
     }
 
-    m_api_client->set_connection_timeout(CONNECTION_TIMEOUT_SECONDS);
-    m_api_client->set_read_timeout(READ_TIMEOUT_SECONDS);
+    m_api_client->set_connection_timeout(m_config->connectionTimeoutSeconds());
+    m_api_client->set_read_timeout(m_config->readTimeoutSeconds());
     m_api_client->set_keep_alive(true);
 
     mclog("API client initialized with keep-alive enabled\n");
