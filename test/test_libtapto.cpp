@@ -18,6 +18,7 @@
 #include "tapto/config.h"
 #include "tapto/context.h"
 #include "tapto/encoding.h"
+#include "tapto/fstools.h"
 #include "tapto/secret.h"
 #include "tapto/tool_image.h"
 #include "tapto/tool_registry.h"
@@ -236,6 +237,185 @@ void test_tool_definition_formats() {
     CHECK(tool_definition_to_json(spec, ToolFormat::OpenAI).contains("parameters"));
 }
 
+// --- folders ----------------------------------------------------------------
+
+struct Tree {
+    fs::path root;
+    explicit Tree(const char* name) : root(scratch_file(name)) {
+        fs::remove_all(root);
+        fs::create_directories(root / "proj" / "src");
+        fs::create_directories(root / "proj" / "build");
+        fs::create_directories(root / "proj" / ".git");
+        fs::create_directories(root / "other");
+        write(root / "proj" / "README.md", "# proj\n\nHello world.\n");
+        write(root / "proj" / "src" / "main.cpp", "int main() {\n  return 0; // needle\n}\n");
+        write(root / "proj" / "src" / "blob.bin", std::string("PNG\0\0\0junk", 10));
+        write(root / "proj" / "build" / "out.o", "needle in build output\n");
+        write(root / "other" / "secret.txt", "not for the model\n");
+    }
+    ~Tree() { std::error_code ec; fs::remove_all(root, ec); }
+    static void write(const fs::path& p, const std::string& content) {
+        std::ofstream out(p, std::ios::binary);
+        out << content;
+    }
+};
+
+std::string run(const std::vector<ToolSpec>& tools, const char* name, json in) {
+    Context ctx;
+    for (const auto& t : tools)
+        if (t.name == name) return t.executor(ctx, in);
+    return "no such tool";
+}
+
+bool starts_with(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
+bool contains(const std::string& s, const char* needle) { return s.find(needle) != std::string::npos; }
+
+void test_folder_set_grants() {
+    Tree t("folders-grant");
+    tapto::FolderSet set;
+    CHECK(set.empty());
+
+    std::string label;
+    CHECK_EQ(set.add((t.root / "proj").string(), &label), std::string(""));
+    CHECK_EQ(label, std::string("proj"));
+    CHECK_EQ(set.folders().size(), std::size_t(1));
+
+    // Granting again, or a subfolder, adds nothing and names the cover.
+    CHECK_EQ(set.add((t.root / "proj" / "src").string(), &label), std::string(""));
+    CHECK_EQ(label, std::string("proj"));
+    CHECK_EQ(set.folders().size(), std::size_t(1));
+
+    // Bad grants are refused with a reason.
+    CHECK(starts_with(set.add((t.root / "nope").string()), "ERROR:"));
+    CHECK(starts_with(set.add((t.root / "proj" / "README.md").string()), "ERROR:"));
+    CHECK(starts_with(set.add(""), "ERROR:"));
+
+    // A second folder with the same last component gets a distinct label.
+    fs::create_directories(t.root / "other" / "proj");
+    CHECK_EQ(set.add((t.root / "other" / "proj").string(), &label), std::string(""));
+    CHECK_EQ(label, std::string("proj-2"));
+
+    // Remove by label and by path.
+    CHECK(set.remove("proj-2"));
+    CHECK(!set.remove("proj-2"));
+    CHECK(set.remove((t.root / "proj").string()));
+    CHECK(set.empty());
+}
+
+void test_folder_set_resolve() {
+    Tree t("folders-resolve");
+    tapto::FolderSet set;
+    fs::path out;
+    std::string err;
+
+    // Nothing granted: every path is refused, and the message says how to fix it.
+    CHECK(!set.resolve("anything", out, err));
+    CHECK(contains(err, "/add-folder"));
+
+    set.add((t.root / "proj").string());
+
+    // Label-relative, bare label, absolute, and root-relative (one folder).
+    CHECK(set.resolve("proj/src/main.cpp", out, err));
+    CHECK(fs::equivalent(out, t.root / "proj" / "src" / "main.cpp"));
+    CHECK(set.resolve("proj", out, err));
+    CHECK(fs::equivalent(out, t.root / "proj"));
+    CHECK(set.resolve((t.root / "proj" / "README.md").string(), out, err));
+    CHECK(set.resolve("src/main.cpp", out, err));
+    CHECK(fs::equivalent(out, t.root / "proj" / "src" / "main.cpp"));
+
+    // Escapes: dot-dot, an absolute path elsewhere, a sibling folder.
+    CHECK(!set.resolve("proj/../other/secret.txt", out, err));
+    CHECK(contains(err, "outside"));
+    CHECK(!set.resolve((t.root / "other" / "secret.txt").string(), out, err));
+    CHECK(!set.resolve("proj/src/../../other/secret.txt", out, err));
+
+    // A prefix that merely starts with the root's name is not inside it.
+    fs::create_directories(t.root / "project-evil");
+    CHECK(!set.resolve((t.root / "project-evil").string(), out, err));
+
+    // display() gives the model-facing form back.
+    CHECK_EQ(set.display(t.root / "proj" / "src" / "main.cpp"), std::string("proj/src/main.cpp"));
+    CHECK_EQ(set.display(t.root / "proj"), std::string("proj"));
+
+    // With two folders a bare relative path is ambiguous and says so.
+    set.add((t.root / "other").string());
+    CHECK(!set.resolve("src/main.cpp", out, err));
+    CHECK(contains(err, "ambiguous"));
+    CHECK(set.resolve("other/secret.txt", out, err));
+}
+
+void test_folder_tools() {
+    Tree t("folders-tools");
+    tapto::FolderSet set;
+    auto tools = tapto::folder_tools(set);
+    CHECK_EQ(tools.size(), std::size_t(4));
+
+    // Before any grant every tool explains itself rather than failing oddly.
+    CHECK(contains(run(tools, "list_folders", json::object()), "No folders"));
+    CHECK(starts_with(run(tools, "read_file", json{{"path", "x"}}), "ERROR:"));
+
+    set.add((t.root / "proj").string());
+    CHECK(contains(run(tools, "list_folders", json::object()), "proj"));
+
+    // list_files skips build/ and .git/, shows sizes, honours the glob.
+    const std::string listing = run(tools, "list_files", json::object());
+    CHECK(contains(listing, "proj/README.md"));
+    CHECK(contains(listing, "proj/src/main.cpp"));
+    CHECK(!contains(listing, "out.o"));
+    CHECK(contains(listing, "bytes"));
+    const std::string cpp_only = run(tools, "list_files", json{{"pattern", "*.cpp"}});
+    CHECK(contains(cpp_only, "main.cpp"));
+    CHECK(!contains(cpp_only, "README"));
+    CHECK(contains(run(tools, "list_files", json{{"pattern", "*.zzz"}}), "No files"));
+
+    // read_file: numbered lines, slices, binary detection, directory refusal.
+    const std::string whole = run(tools, "read_file", json{{"path", "proj/src/main.cpp"}});
+    CHECK(contains(whole, "1|int main() {"));
+    CHECK(contains(whole, "3|}"));
+    CHECK(contains(whole, "(3 lines)"));
+    const std::string slice = run(tools, "read_file", json{{"path", "proj/src/main.cpp"}, {"start_line", 2}, {"end_line", 2}});
+    CHECK(contains(slice, "2|  return 0;"));
+    CHECK(!contains(slice, "1|int"));
+    CHECK(contains(slice, "showing 2-2"));
+    CHECK(contains(run(tools, "read_file", json{{"path", "proj/src/blob.bin"}}), "binary"));
+    CHECK(starts_with(run(tools, "read_file", json{{"path", "proj/src"}}), "ERROR:"));
+    CHECK(starts_with(run(tools, "read_file", json{{"path", "proj/nope.txt"}}), "ERROR:"));
+    CHECK(starts_with(run(tools, "read_file", json{{"path", "proj/../other/secret.txt"}}), "ERROR:"));
+    CHECK(starts_with(run(tools, "read_file", json{{"path", "proj/src/main.cpp"}, {"start_line", 9}}), "ERROR:"));
+
+    // search_files: finds the needle in src, not in build; binary skipped.
+    const std::string found = run(tools, "search_files", json{{"query", "needle"}});
+    CHECK(contains(found, "proj/src/main.cpp"));
+    CHECK(contains(found, "2: "));
+    CHECK(!contains(found, "out.o"));
+    CHECK(contains(run(tools, "search_files", json{{"query", "absent-string"}}), "No files"));
+    CHECK(starts_with(run(tools, "search_files", json{{"query", ""}}), "ERROR:"));
+
+    // The prompt paragraph names the folder; empty when nothing is granted.
+    CHECK(contains(tapto::folder_prompt(set), "proj"));
+    set.clear();
+    CHECK(tapto::folder_prompt(set).empty());
+    // Tools built earlier see the cleared set.
+    CHECK(contains(run(tools, "list_folders", json::object()), "No folders"));
+}
+
+void test_fs_helpers() {
+    CHECK(tapto::wildcard_match("*.cpp", "main.cpp"));
+    CHECK(!tapto::wildcard_match("*.cpp", "main.h"));
+    CHECK(tapto::wildcard_match("ma?n.*", "main.cpp"));
+    CHECK(tapto::wildcard_match("*", ""));
+    CHECK(tapto::is_noise_dir(".git"));
+    CHECK(tapto::is_noise_dir("build-ide"));
+    CHECK(!tapto::is_noise_dir("builder"));
+    CHECK_EQ(tapto::content_lines("a\nb\n").size(), std::size_t(2));
+    CHECK_EQ(tapto::content_lines("a\r\nb").size(), std::size_t(2));
+    CHECK_EQ(tapto::content_lines("").size(), std::size_t(0));
+    CHECK(tapto::looks_binary(std::string("ab\0cd", 5)));
+    CHECK(!tapto::looks_binary("plain"));
+    CHECK(contains(tapto::cap_output(std::string(100, 'x'), 10), "truncated"));
+    CHECK_EQ(tapto::cap_output("short", 10), std::string("short"));
+}
+
 } // namespace
 
 int main() {
@@ -247,6 +427,10 @@ int main() {
     test_prune_history_images();
     test_tool_display_name();
     test_tool_definition_formats();
+    test_fs_helpers();
+    test_folder_set_grants();
+    test_folder_set_resolve();
+    test_folder_tools();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed\n";

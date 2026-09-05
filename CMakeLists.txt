@@ -59,6 +59,7 @@ add_library(tapto STATIC
   src/secret.cpp
   src/provider.cpp
   src/encoding.cpp
+  src/fstools.cpp
   src/tool_image.cpp
 )
 add_library(tapto::tapto ALIAS tapto)
