@@ -60,6 +60,7 @@ add_library(tapto STATIC
   src/provider.cpp
   src/encoding.cpp
   src/fstools.cpp
+  src/certs.cpp
   src/tool_image.cpp
 )
 add_library(tapto::tapto ALIAS tapto)
@@ -80,9 +81,10 @@ target_link_libraries(tapto PUBLIC
   Threads::Threads
 )
 
-# CredReadW / CredFree, for the `wincred:` secret scheme in tapto/secret.h.
+# CredReadW / CredFree, for the `wincred:` secret scheme in tapto/secret.h;
+# crypt32 for the user's trusted-root store in tapto/certs.h.
 if(WIN32)
-  target_link_libraries(tapto PUBLIC advapi32)
+  target_link_libraries(tapto PUBLIC advapi32 crypt32)
 endif()
 
 if(MSVC)

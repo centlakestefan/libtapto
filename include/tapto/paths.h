@@ -26,4 +26,9 @@ std::filesystem::path config_path(Level level);
 // (".tapto/commands").
 std::filesystem::path commands_path(Level level);
 
+// The per-user tapto directory (~/.tapto), home of the global store and of
+// anything else that belongs to the user rather than to a project: the
+// certificates the sidecars serve, for one.
+std::filesystem::path global_dir();
+
 } // namespace tapto

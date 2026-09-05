@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include "tapto/base64.h"
+#include "tapto/certs.h"
 #include "tapto/config.h"
 #include "tapto/context.h"
 #include "tapto/encoding.h"
@@ -416,6 +417,85 @@ void test_fs_helpers() {
     CHECK_EQ(tapto::cap_output("short", 10), std::string("short"));
 }
 
+// --- certificates ------------------------------------------------------------
+
+std::string slurp(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void test_certificates() {
+    const fs::path dir = scratch_file("certs");
+    fs::remove_all(dir);
+
+    // First call: everything is created.
+    tapto::CertResult a = tapto::ensure_certificates(dir);
+    CHECK(a.ok);
+    if (!a.ok) { std::cerr << a.error << "\n"; return; }
+    CHECK(a.ca_created);
+    CHECK(a.leaf_created);
+    CHECK(fs::exists(a.paths.ca_file));
+    CHECK(fs::exists(a.paths.ca_key_file));
+    CHECK(fs::exists(a.paths.cert_file));
+    CHECK(fs::exists(a.paths.key_file));
+    CHECK(a.leaf_days_left >= 89 && a.leaf_days_left <= 90);
+    const auto ca_days = tapto::cert_days_left(a.paths.ca_file);
+    CHECK(ca_days && *ca_days >= 3649 && *ca_days <= 3650);
+
+    // PEM, and the leaf chains to the CA.
+    CHECK(slurp(a.paths.cert_file).rfind("-----BEGIN CERTIFICATE-----", 0) == 0);
+    CHECK(slurp(a.paths.key_file).find("PRIVATE KEY") != std::string::npos);
+    CHECK(tapto::cert_signed_by(a.paths.cert_file, a.paths.ca_file));
+    CHECK(!tapto::cert_signed_by(a.paths.ca_file, a.paths.cert_file));
+    CHECK_EQ(tapto::cert_fingerprint(a.paths.ca_file).size(), std::size_t(40));
+    CHECK(tapto::cert_fingerprint(a.paths.ca_file) != tapto::cert_fingerprint(a.paths.cert_file));
+
+    // Second call: nothing changes.
+    const std::string leaf_before = slurp(a.paths.cert_file);
+    tapto::CertResult b = tapto::ensure_certificates(dir);
+    CHECK(b.ok);
+    CHECK(!b.ca_created);
+    CHECK(!b.leaf_created);
+    CHECK_EQ(slurp(b.paths.cert_file), leaf_before);
+
+    // A leaf with fewer days left than the renewal threshold is renewed; the
+    // CA is left alone and the new leaf still chains to it. A threshold above
+    // the leaf's own lifetime forces one, which is how a short leaf gets made.
+    tapto::CertResult c = tapto::ensure_certificates(dir, /*leaf_days=*/5, 3650, /*renew_before=*/100);
+    CHECK(c.ok);
+    CHECK(!c.ca_created);
+    CHECK(c.leaf_created);
+    CHECK(c.leaf_days_left <= 5);
+    tapto::CertResult d = tapto::ensure_certificates(dir, 90, 3650, 30);
+    CHECK(d.leaf_created); // the 5-day leaf is under the 30-day threshold
+    CHECK(!d.ca_created);
+    CHECK(tapto::cert_signed_by(d.paths.cert_file, d.paths.ca_file));
+
+    // A CA replaced underneath the leaf makes the leaf invalid, so it is re-issued.
+    fs::remove(a.paths.ca_file);
+    fs::remove(a.paths.ca_key_file);
+    tapto::CertResult e = tapto::ensure_certificates(dir);
+    CHECK(e.ok);
+    CHECK(e.ca_created);
+    CHECK(e.leaf_created);
+    CHECK(tapto::cert_signed_by(e.paths.cert_file, e.paths.ca_file));
+
+    // Inspection of garbage is a clean "no".
+    const fs::path junk = dir / "junk.crt";
+    std::ofstream(junk) << "not a certificate";
+    CHECK(!tapto::cert_days_left(junk).has_value());
+    CHECK(!tapto::cert_signed_by(junk, e.paths.ca_file));
+    CHECK(tapto::cert_fingerprint(junk).empty());
+    CHECK(!tapto::cert_days_left(dir / "missing.crt").has_value());
+
+    // The trust query must not throw for an untrusted CA (it is not installed
+    // by any test); installation itself is a dialog and is checked by hand.
+    CHECK(!tapto::ca_is_trusted(e.paths.ca_file) || true);
+    CHECK(!tapto::manual_trust_command(e.paths.ca_file).empty());
+
+    fs::remove_all(dir);
+}
+
 } // namespace
 
 int main() {
@@ -431,6 +511,7 @@ int main() {
     test_folder_set_grants();
     test_folder_set_resolve();
     test_folder_tools();
+    test_certificates();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed\n";

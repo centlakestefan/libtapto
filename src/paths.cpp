@@ -94,6 +94,10 @@ const char* level_name(Level level) {
     return "unknown";
 }
 
+fs::path global_dir() {
+    return home_dir() / ".tapto";
+}
+
 fs::path config_path(Level level) {
     return store_path(level, "config");
 }
