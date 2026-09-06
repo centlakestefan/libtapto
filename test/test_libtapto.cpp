@@ -2,24 +2,28 @@
 // Copyright 2026 Centlake Software AB
 
 // Unit tests for the parts of libtapto that need no provider on the other end:
-// the config store, secret references, UTF-8 sanitising, tool images and the
-// tool display hook. Plain assertions; ctest runs the binary.
+// the config store, secret references, UTF-8 sanitising, tool images, the
+// /compact trimmer and the tool display hook. Plain assertions; ctest runs
+// the binary.
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
 
+#include "tapto/aibackend.h"
 #include "tapto/base64.h"
 #include "tapto/certs.h"
 #include "tapto/config.h"
 #include "tapto/context.h"
 #include "tapto/encoding.h"
 #include "tapto/fstools.h"
+#include "tapto/provider.h"
 #include "tapto/secret.h"
 #include "tapto/tool_image.h"
 #include "tapto/tool_registry.h"
@@ -218,6 +222,156 @@ void test_tool_display_name() {
     CHECK_EQ(getToolDisplayName(tools, "edit", json{{"path", "a.cpp"}}), std::string("Edit a.cpp"));
     CHECK_EQ(getToolDisplayName(tools, "broken", json::object()), std::string("broken"));
     CHECK_EQ(getToolDisplayName(tools, "unknown", json::object()), std::string("unknown"));
+}
+
+// --- /compact input trimming ------------------------------------------------
+//
+// buildTrimmedHistoryForSummary() is header-only on AiBackend, so a backend
+// whose only job is to hand back a canned history drives it without a
+// provider, key or network. Each of the three history shapes (OpenAI
+// role:"tool", Claude tool_result blocks, Gemini functionResponse parts) must
+// have its oversized results shrunk and everything else -- the small results,
+// the user and assistant text, and above all the tool *calls* -- left intact.
+// It must also be a pure function of the history.
+
+class FakeBackend : public AiBackend {
+public:
+    json m_hist;
+
+    void setSystemPrompt(const std::string&) override {}
+    const std::string& getSystemPrompt() const override { return m_sp; }
+    void setModel(const std::string&) override {}
+    void setHost(const std::string&) override {}
+    void setApiKeyRef(const std::string&) override {}
+    void setThinkingBudget(std::optional<int>) override {}
+    std::string chat(Context&, const std::string&) override { return ""; }
+    void start() override { m_hist = json::array(); }
+    bool hasHistory() const override { return !m_hist.empty(); }
+    void loadHistory(const json& h) override { m_hist = h; }
+    json getHistory() const override { return m_hist; }
+    std::size_t lastInputTokens() const override { return 0; }
+    void beginWithSummary(const std::string&) override { m_hist = json::array(); }
+
+private:
+    std::string m_sp;
+};
+
+void test_compact_trimmer() {
+    FakeBackend be;
+    // Well over and well under the 2000-character limit.
+    const std::string big(5000, 'a');
+    const std::string small = "ok";
+    const std::string big_ph = "[omitted tool output (5000 chars)]";
+
+    // OpenAI: oversized tool result shrunk, small kept, the call intact.
+    {
+        json hist = json::array();
+        hist.push_back({{"role", "user"}, {"content", "read the main file"}});
+        hist.push_back({{"role", "assistant"}, {"content", ""},
+                        {"tool_calls", json::array({json{
+                            {"id", "c1"},
+                            {"function", {{"name", "str_replace_based_edit_tool"},
+                                          {"arguments", "{\"path\":\"src/main.cpp\"}"}}}}})}});
+        hist.push_back({{"role", "tool"}, {"tool_call_id", "c1"}, {"content", big}});
+        hist.push_back({{"role", "tool"}, {"tool_call_id", "c2"}, {"content", small}});
+        hist.push_back({{"role", "assistant"}, {"content", "done, it was fine"}});
+        be.loadHistory(hist);
+
+        json t = be.buildTrimmedHistoryForSummary();
+        CHECK_EQ(t.size(), std::size_t(5));
+        CHECK_EQ(t[2]["content"].get<std::string>(), big_ph);
+        CHECK_EQ(t[3]["content"].get<std::string>(), small);
+        CHECK_EQ(t[1]["tool_calls"][0]["function"]["name"].get<std::string>(),
+                 std::string("str_replace_based_edit_tool"));
+        CHECK_EQ(t[1]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
+                 std::string("{\"path\":\"src/main.cpp\"}"));
+        CHECK_EQ(t[4]["content"].get<std::string>(), std::string("done, it was fine"));
+    }
+
+    // Claude: tool_result blocks shrunk; the tool_use block preserved.
+    {
+        json hist = json::array();
+        hist.push_back({{"role", "user"}, {"content", "look at the file"}});
+        hist.push_back({{"role", "assistant"},
+                        {"content", json::array({
+                            json{{"type", "text"}, {"text", "reading now"}},
+                            json{{"type", "tool_use"}, {"id", "u1"},
+                                 {"name", "str_replace_based_edit_tool"},
+                                 {"input", {{"path", "src/main.cpp"}}}}})}});
+        hist.push_back({{"role", "user"},
+                        {"content", json::array({
+                            json{{"type", "tool_result"}, {"tool_use_id", "u1"}, {"content", big}},
+                            json{{"type", "tool_result"}, {"tool_use_id", "u2"}, {"content", small}}})}});
+        hist.push_back({{"role", "assistant"},
+                        {"content", json::array({json{{"type", "text"}, {"text", "ok"}}})}});
+        be.loadHistory(hist);
+
+        json t = be.buildTrimmedHistoryForSummary();
+        CHECK_EQ(t.size(), std::size_t(4));
+        CHECK_EQ(t[2]["content"][0]["content"].get<std::string>(), big_ph);
+        CHECK_EQ(t[2]["content"][1]["content"].get<std::string>(), small);
+        CHECK_EQ(t[1]["content"][1]["type"].get<std::string>(), std::string("tool_use"));
+        CHECK_EQ(t[1]["content"][1]["input"]["path"].get<std::string>(), std::string("src/main.cpp"));
+    }
+
+    // Gemini: functionResponse shrunk; functionCall preserved.
+    {
+        json hist = json::array();
+        hist.push_back({{"role", "user"}, {"parts", json::array({json{{"text", "read it"}}})}});
+        hist.push_back({{"role", "model"},
+                        {"parts", json::array({json{{"functionCall", {
+                            {"name", "str_replace_based_edit_tool"},
+                            {"args", {{"path", "src/main.cpp"}}}}}}})}});
+        hist.push_back({{"role", "user"},
+                        {"parts", json::array({
+                            json{{"functionResponse", {{"name", "str_replace_based_edit_tool"},
+                                                       {"response", {{"content", big}}}}}},
+                            json{{"functionResponse", {{"name", "run_command"},
+                                                       {"response", {{"content", small}}}}}}})}});
+        hist.push_back({{"role", "model"}, {"parts", json::array({json{{"text", "done"}}})}});
+        be.loadHistory(hist);
+
+        json t = be.buildTrimmedHistoryForSummary();
+        CHECK_EQ(t.size(), std::size_t(4));
+        CHECK_EQ(t[2]["parts"][0]["functionResponse"]["response"]["content"].get<std::string>(), big_ph);
+        CHECK_EQ(t[2]["parts"][1]["functionResponse"]["response"]["content"].get<std::string>(), small);
+        CHECK_EQ(t[1]["parts"][0]["functionCall"]["args"]["path"].get<std::string>(),
+                 std::string("src/main.cpp"));
+    }
+
+    // Pure: the live history is never mutated.
+    {
+        json hist = json::array();
+        hist.push_back({{"role", "tool"}, {"tool_call_id", "c1"}, {"content", big}});
+        be.loadHistory(hist);
+        const json before = be.getHistory();
+        json t = be.buildTrimmedHistoryForSummary();
+        CHECK(be.getHistory() == before);
+        CHECK_EQ(t[0]["content"].get<std::string>(), big_ph);
+    }
+
+    // No-op: nothing oversized maps back to an identical copy.
+    {
+        json hist = json::array();
+        hist.push_back({{"role", "user"}, {"content", "hi"}});
+        hist.push_back({{"role", "assistant"}, {"content", "hello there"}});
+        be.loadHistory(hist);
+        CHECK(be.buildTrimmedHistoryForSummary() == be.getHistory());
+    }
+}
+
+// --- provider helpers -------------------------------------------------------
+//
+// Only the pure one. default_provider_name(), provider_dialect() and
+// resolve_api_key() read the user's real config store, which a unit test has
+// no business touching.
+
+void test_api_key_env_var() {
+    CHECK_EQ(std::string(tapto::api_key_env_var("claude")), std::string("ANTHROPIC_API_KEY"));
+    CHECK_EQ(std::string(tapto::api_key_env_var("openai")), std::string("OPENAI_API_KEY"));
+    CHECK_EQ(std::string(tapto::api_key_env_var("gemini")), std::string("GEMINI_API_KEY"));
+    CHECK(tapto::api_key_env_var("qwen36") != nullptr);
+    CHECK_EQ(std::string(tapto::api_key_env_var("qwen36")), std::string());
 }
 
 void test_tool_definition_formats() {
@@ -506,6 +660,8 @@ int main() {
     test_tool_image_context();
     test_prune_history_images();
     test_tool_display_name();
+    test_compact_trimmer();
+    test_api_key_env_var();
     test_tool_definition_formats();
     test_fs_helpers();
     test_folder_set_grants();

@@ -40,13 +40,6 @@ std::string default_model(const std::string& dialect) {
     return "";
 }
 
-const char* api_key_env_var(const std::string& dialect) {
-    if (dialect == "claude") return "ANTHROPIC_API_KEY";
-    if (dialect == "openai") return "OPENAI_API_KEY";
-    if (dialect == "gemini") return "GEMINI_API_KEY";
-    return "";
-}
-
 std::optional<std::string> env_value(const char* name) {
     if (!name || !*name) return std::nullopt;
 #ifdef _MSC_VER
@@ -73,6 +66,15 @@ std::vector<std::string> configured_provider_names() {
         if (!name.empty()) names.push_back(std::move(name));
     }
     return names;
+}
+
+} // namespace
+
+const char* api_key_env_var(const std::string& dialect) {
+    if (dialect == "claude") return "ANTHROPIC_API_KEY";
+    if (dialect == "openai") return "OPENAI_API_KEY";
+    if (dialect == "gemini") return "GEMINI_API_KEY";
+    return "";
 }
 
 // The provider used when none is named on the command line. `provider-type`
@@ -116,8 +118,6 @@ Secret resolve_api_key(const std::string& name, const std::string& dialect) {
     }
     return Secret{};
 }
-
-} // namespace
 
 std::vector<EffectiveEntry> effective_config() {
     std::vector<EffectiveEntry> merged;

@@ -54,6 +54,35 @@ std::optional<std::string> get_effective(const std::string& key);
 // `gemini` need no block at all.
 bool is_dialect(const std::string& s);
 
+// --- The pieces of resolution a first-run setup needs one at a time ---------
+//
+// resolve_provider() below does the whole job for a chat session. A program
+// that walks the user through configuring one (tapto-code's setup prompts)
+// needs to ask the same questions separately: is there a default provider,
+// what dialect is it, which environment variable would carry its key, and is
+// a key already available before prompting for one.
+
+// The provider used when none is named on the command line: the `provider`
+// key, else the legacy unscoped `provider-type`. nullopt when neither is set.
+std::optional<std::string> default_provider_name();
+
+// The dialect a provider name resolves to: its block's `-provider-type`, or the
+// name itself when that is a dialect. Empty when the name isn't configured.
+std::string provider_dialect(const std::string& name);
+
+// The vendor's conventional environment variable for a dialect's API key
+// (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY). "" for anything else;
+// never null.
+const char* api_key_env_var(const std::string& dialect);
+
+// The API key for a provider block, in order: the block's own `<name>-api-key`
+// (a literal or a secret reference), the dialect's environment variable, and
+// for the default provider only, the unscoped `api-key`. Returns an unresolved
+// Secret when none is configured, and one carrying `error` when a reference is
+// configured but cannot be read -- the caller should report that rather than
+// prompt for a replacement.
+Secret resolve_api_key(const std::string& name, const std::string& dialect);
+
 // A provider block resolved into everything a chat session needs.
 struct ResolvedProvider {
     std::string name;    // the config block, e.g. "qwen36"

@@ -52,4 +52,77 @@ public:
     // a summary of the discussion up to this point (used by the /compact
     // command). Providers must format the seed message in their native shape.
     virtual void beginWithSummary(const std::string& summaryText) = 0;
+
+    // Compaction input trimming (used by the /compact command). Summarizing
+    // the conversation means *sending it* -- so this is the single largest
+    // request of the session, carrying every file dump the tools produced.
+    // buildTrimmedHistoryForSummary() returns a *copy* of the current history
+    // with any oversized tool-result payload replaced by a short placeholder,
+    // so that request stays small and leaves output-token headroom on providers
+    // that share one window for input + output (vLLM, Ollama, LM Studio, ...).
+    //
+    // The live conversation (m_conversation_history) is never touched: on a
+    // successful compact it is replaced by the summary, and on failure the
+    // caller restores the original history it snapshot. Only *large results*
+    // are shrunk -- the tool *calls* (which file was read, what was edited) are
+    // left intact, and that pairing is exactly what the summarizer needs.
+    //
+    // Header-only on purpose: it walks the three history shapes by their JSON
+    // and needs nothing from the provider, so every backend gets it for free.
+    nlohmann::json buildTrimmedHistoryForSummary() {
+        using json = nlohmann::json;
+        json history = getHistory();
+        if (!history.is_array()) return history;
+        const std::size_t limit = kCompactTrimPayloadChars;
+
+        auto placeholder = [](const std::size_t len) {
+            return std::string("[omitted tool output (")
+                 + std::to_string(len) + " chars)]";
+        };
+        // Shrink a payload in place if it exceeds the limit; leave it alone if
+        // not (or if it is not a string -- short/structured output is kept).
+        auto shrink = [&](json& c) {
+            if (c.is_string()) {
+                std::string s = c.get<std::string>();
+                if (s.size() > limit) c = placeholder(s.size());
+            }
+        };
+
+        for (auto& msg : history) {
+            if (!msg.is_object()) continue;
+
+            // OpenAI: a tool result is a message of role "tool" with a string
+            // "content" field.
+            if (msg.value("role", std::string()) == "tool" && msg.contains("content"))
+                shrink(msg["content"]);
+
+            // Claude: a user turn whose "content" is a block array; each result
+            // is a block of type "tool_result" carrying a string "content".
+            if (msg.contains("content") && msg["content"].is_array())
+                for (auto& block : msg["content"])
+                    if (block.is_object()
+                        && block.value("type", std::string()) == "tool_result"
+                        && block.contains("content"))
+                        shrink(block["content"]);
+
+            // Gemini: a part may hold a functionResponse with a "response.
+            //  content" string.
+            if (msg.contains("parts") && msg["parts"].is_array())
+                for (auto& part : msg["parts"])
+                    if (part.is_object() && part.contains("functionResponse")
+                        && part["functionResponse"].is_object()
+                        && part["functionResponse"].contains("response")
+                        && part["functionResponse"]["response"].is_object()
+                        && part["functionResponse"]["response"].contains("content"))
+                        shrink(part["functionResponse"]["response"]["content"]);
+        }
+        return history;
+    }
+
+private:
+    // Tool-result payloads longer than this many characters are replaced by a
+    // short placeholder when building the /compact summarization input (see
+    // buildTrimmedHistoryForSummary). Short outputs (status lines, small reads)
+    // are kept verbatim; long ones (whole-file dumps, large greps) are not.
+    static constexpr std::size_t kCompactTrimPayloadChars = 2000;
 };
