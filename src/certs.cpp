@@ -4,6 +4,7 @@
 #include "tapto/certs.h"
 
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -53,21 +54,33 @@ const char* kLeafKeyFile = "localhost.key";
 
 // --- files -------------------------------------------------------------------
 
+// The one fopen in this file. On Windows the path is opened wide, which is
+// the only form that survives a non-ASCII profile directory, and through the
+// _s variant because MSVC deprecates the standard one at /W4 (C4996).
+FILE* open_file(const fs::path& path, const char* mode) {
+#ifdef _WIN32
+    const std::wstring wmode(mode, mode + std::strlen(mode));
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), wmode.c_str()) != 0) return nullptr;
+    return f;
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
 // fopen with owner-only permissions on POSIX, set before anything is written,
 // so a private key is never on disk world-readable even for a moment. Windows
 // profile directories are ACL'd to the user already.
 FILE* open_private(const fs::path& path) {
-#ifdef _WIN32
-    return std::fopen(path.string().c_str(), "wb");
-#else
-    FILE* f = std::fopen(path.string().c_str(), "wb");
-    if (f) (void)::chmod(path.string().c_str(), 0600);
-    return f;
+    FILE* f = open_file(path, "wb");
+#ifndef _WIN32
+    if (f) (void)::chmod(path.c_str(), 0600);
 #endif
+    return f;
 }
 
 Cert read_cert(const fs::path& path) {
-    FILE* f = std::fopen(path.string().c_str(), "rb");
+    FILE* f = open_file(path, "rb");
     if (!f) return nullptr;
     Cert cert(PEM_read_X509(f, nullptr, nullptr, nullptr));
     std::fclose(f);
@@ -75,7 +88,7 @@ Cert read_cert(const fs::path& path) {
 }
 
 Pkey read_key(const fs::path& path) {
-    FILE* f = std::fopen(path.string().c_str(), "rb");
+    FILE* f = open_file(path, "rb");
     if (!f) return nullptr;
     Pkey key(PEM_read_PrivateKey(f, nullptr, nullptr, nullptr));
     std::fclose(f);
@@ -83,7 +96,7 @@ Pkey read_key(const fs::path& path) {
 }
 
 bool write_cert(const fs::path& path, X509* cert) {
-    FILE* f = std::fopen(path.string().c_str(), "wb");
+    FILE* f = open_file(path, "wb");
     if (!f) return false;
     const bool ok = PEM_write_X509(f, cert) == 1;
     std::fclose(f);
