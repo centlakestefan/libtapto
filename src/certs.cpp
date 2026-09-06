@@ -3,13 +3,16 @@
 
 #include "tapto/certs.h"
 
-#include <cstdio>
-#include <cstring>
+#include <cstddef>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
 
+#include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -30,7 +33,9 @@
 #  undef OCSP_REQUEST
 #  undef OCSP_RESPONSE
 #else
+#  include <fcntl.h>
 #  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -43,9 +48,11 @@ namespace {
 struct PkeyDel { void operator()(EVP_PKEY* p) const { EVP_PKEY_free(p); } };
 struct X509Del { void operator()(X509* p) const { X509_free(p); } };
 struct BnDel { void operator()(BIGNUM* p) const { BN_free(p); } };
+struct BioDel { void operator()(BIO* p) const { BIO_free(p); } };
 using Pkey = std::unique_ptr<EVP_PKEY, PkeyDel>;
 using Cert = std::unique_ptr<X509, X509Del>;
 using Bn = std::unique_ptr<BIGNUM, BnDel>;
+using Bio = std::unique_ptr<BIO, BioDel>;
 
 const char* kCaFile = "tapto-ca.crt";
 const char* kCaKeyFile = "tapto-ca.key";
@@ -54,61 +61,77 @@ const char* kLeafKeyFile = "localhost.key";
 
 // --- files -------------------------------------------------------------------
 
-// The one fopen in this file. On Windows the path is opened wide, which is
-// the only form that survives a non-ASCII profile directory, and through the
-// _s variant because MSVC deprecates the standard one at /W4 (C4996).
-FILE* open_file(const fs::path& path, const char* mode) {
-#ifdef _WIN32
-    const std::wstring wmode(mode, mode + std::strlen(mode));
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, path.c_str(), wmode.c_str()) != 0) return nullptr;
-    return f;
-#else
-    return std::fopen(path.c_str(), mode);
-#endif
+// PEM goes between disk and OpenSSL through memory BIOs and this file's own
+// I/O, never through a FILE*. OpenSSL may be a DLL built against a different
+// C runtime than the program -- Strawberry's MinGW libcrypto under an MSVC
+// build is the case that found this -- and a FILE* from one runtime handed to
+// the other is a crash, not an error. PEM is small text, so a whole-file
+// string is the natural unit anyway.
+
+std::optional<std::string> read_all(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-// fopen with owner-only permissions on POSIX, set before anything is written,
-// so a private key is never on disk world-readable even for a moment. Windows
+// `owner_only` creates the file 0600 on POSIX before a byte is written, so a
+// private key is never on disk world-readable even for a moment. Windows
 // profile directories are ACL'd to the user already.
-FILE* open_private(const fs::path& path) {
-    FILE* f = open_file(path, "wb");
+bool write_all(const fs::path& path, const std::string& bytes, bool owner_only) {
 #ifndef _WIN32
-    if (f) (void)::chmod(path.c_str(), 0600);
+    if (owner_only) {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return false;
+        std::size_t off = 0;
+        while (off < bytes.size()) {
+            const ssize_t n = ::write(fd, bytes.data() + off, bytes.size() - off);
+            if (n < 0) { ::close(fd); return false; }
+            off += static_cast<std::size_t>(n);
+        }
+        return ::close(fd) == 0;
+    }
+#else
+    (void)owner_only;
 #endif
-    return f;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return out.good();
+}
+
+std::string bio_contents(BIO* bio) {
+    char* data = nullptr;
+    const long n = BIO_get_mem_data(bio, &data);
+    return (n > 0 && data) ? std::string(data, static_cast<std::size_t>(n)) : std::string();
 }
 
 Cert read_cert(const fs::path& path) {
-    FILE* f = open_file(path, "rb");
-    if (!f) return nullptr;
-    Cert cert(PEM_read_X509(f, nullptr, nullptr, nullptr));
-    std::fclose(f);
-    return cert;
+    const auto pem = read_all(path);
+    if (!pem) return nullptr;
+    Bio bio(BIO_new_mem_buf(pem->data(), static_cast<int>(pem->size())));
+    if (!bio) return nullptr;
+    return Cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
 }
 
 Pkey read_key(const fs::path& path) {
-    FILE* f = open_file(path, "rb");
-    if (!f) return nullptr;
-    Pkey key(PEM_read_PrivateKey(f, nullptr, nullptr, nullptr));
-    std::fclose(f);
-    return key;
+    const auto pem = read_all(path);
+    if (!pem) return nullptr;
+    Bio bio(BIO_new_mem_buf(pem->data(), static_cast<int>(pem->size())));
+    if (!bio) return nullptr;
+    return Pkey(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
 }
 
 bool write_cert(const fs::path& path, X509* cert) {
-    FILE* f = open_file(path, "wb");
-    if (!f) return false;
-    const bool ok = PEM_write_X509(f, cert) == 1;
-    std::fclose(f);
-    return ok;
+    Bio bio(BIO_new(BIO_s_mem()));
+    if (!bio || PEM_write_bio_X509(bio.get(), cert) != 1) return false;
+    return write_all(path, bio_contents(bio.get()), /*owner_only=*/false);
 }
 
 bool write_key(const fs::path& path, EVP_PKEY* key) {
-    FILE* f = open_private(path);
-    if (!f) return false;
-    const bool ok = PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr, nullptr) == 1;
-    std::fclose(f);
-    return ok;
+    Bio bio(BIO_new(BIO_s_mem()));
+    if (!bio || PEM_write_bio_PrivateKey(bio.get(), key, nullptr, nullptr, 0, nullptr, nullptr) != 1)
+        return false;
+    return write_all(path, bio_contents(bio.get()), /*owner_only=*/true);
 }
 
 // --- generation -------------------------------------------------------------
