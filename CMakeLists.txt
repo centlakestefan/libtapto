@@ -77,6 +77,30 @@ if(MSVC AND NOT LIB_EAY_RELEASE)
     endif()
   endforeach()
 endif()
+
+# Where there is no OpenSSL at all (a Windows build agent set up for MSVC and
+# nothing else), fetch a pinned prebuilt rather than fail: FireDaemon's
+# distribution, import libraries plus DLLs, the same one the signal project
+# fetches on the same agent. Gated on OpenSSL not being found, so a machine
+# that has one is untouched. The fetched DLLs need the Visual C++ runtime,
+# which the installer carries app-local.
+find_package(OpenSSL QUIET)
+if(NOT OpenSSL_FOUND AND WIN32 AND NOT LIBTAPTO_STATIC_SSL)
+  message(STATUS "OpenSSL not found on the system; fetching a pinned prebuilt (FireDaemon)")
+  # A short content name: FetchContent nests it several times in a sub-build
+  # path, which can hit MAX_PATH on a deep build directory.
+  FetchContent_Declare(ossl
+    URL      "https://download.firedaemon.com/FireDaemon-OpenSSL/openssl-3.5.4.zip"
+    URL_HASH SHA256=78d73d02ddd56514da45769bf0694871306b219099a756a45459fcaa3dfa35a6
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(ossl)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_ossl_arch x64)
+  else()
+    set(_ossl_arch x86)
+  endif()
+  set(OPENSSL_ROOT_DIR "${ossl_SOURCE_DIR}/${_ossl_arch}" CACHE PATH "" FORCE)
+endif()
 find_package(OpenSSL REQUIRED)
 
 if(NOT TARGET httplib::httplib)
