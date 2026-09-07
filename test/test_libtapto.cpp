@@ -383,6 +383,11 @@ void test_tool_definition_formats() {
     CHECK(tool_definition_to_json(spec, ToolFormat::Claude).contains("input_schema"));
     CHECK(tool_definition_to_json(spec, ToolFormat::OpenAI).contains("parameters"));
     CHECK(tool_definition_to_json(spec, ToolFormat::Gemini).contains("parameters"));
+    // MCP: the Claude shape with the schema key in camelCase.
+    const json mcp = tool_definition_to_json(spec, ToolFormat::Mcp);
+    CHECK(mcp.contains("inputSchema"));
+    CHECK(!mcp.contains("input_schema"));
+    CHECK_EQ(mcp.value("name", std::string()), std::string("t"));
 
     spec.claude_builtin_type = "text_editor_20250728";
     const json builtin = tool_definition_to_json(spec, ToolFormat::Claude);
