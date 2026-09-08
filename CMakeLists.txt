@@ -210,4 +210,26 @@ if(LIBTAPTO_BUILD_TESTS)
     target_compile_options(test-libtapto PRIVATE -Wall -Wextra)
   endif()
   add_test(NAME libtapto COMMAND test-libtapto)
+  # Where OpenSSL is a pair of DLLs that nothing has put on PATH (the
+  # FireDaemon fetch above; a Shining Light install that skipped the PATH
+  # entry) the test dies at load time with STATUS_DLL_NOT_FOUND and no output.
+  # Their directory goes on the test's PATH. ENVIRONMENT_MODIFICATION is
+  # CMake 3.22; older ones run the test as before.
+  if(WIN32 AND OPENSSL_CRYPTO_LIBRARY AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
+    get_filename_component(_ssl_lib_dir "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
+    set(_ssl_bin_dirs "${_ssl_lib_dir}/../bin")
+    if(OPENSSL_ROOT_DIR)
+      file(TO_CMAKE_PATH "${OPENSSL_ROOT_DIR}" _ssl_root)
+      list(APPEND _ssl_bin_dirs "${_ssl_root}/bin")
+    endif()
+    foreach(_dir IN LISTS _ssl_bin_dirs)
+      if(IS_DIRECTORY "${_dir}")
+        get_filename_component(_dir "${_dir}" ABSOLUTE)
+        file(TO_NATIVE_PATH "${_dir}" _dir)
+        set_tests_properties(libtapto PROPERTIES
+          ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dir}")
+        break()
+      endif()
+    endforeach()
+  endif()
 endif()
