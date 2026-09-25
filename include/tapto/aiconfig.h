@@ -20,6 +20,7 @@ public:
     const std::string& openaiReasoningEffort() const { return m_reasoningEffort; }
     int keepRecentImages() const { return m_keepRecentImages; }
     bool printCot() const { return m_printCot; }
+    const std::string& userAgent() const { return m_userAgent; }
 
     void setMaxOutputTokens(int v) { m_maxOutputTokens = v; }
     void setMaxToolIterations(int v) { m_maxToolIterations = v; }
@@ -31,6 +32,7 @@ public:
     void setOpenaiReasoningEffort(std::string v) { m_reasoningEffort = std::move(v); }
     void setKeepRecentImages(int v) { m_keepRecentImages = v; }
     void setPrintCot(bool v) { m_printCot = v; }
+    void setUserAgent(std::string v) { m_userAgent = std::move(v); }
 
 private:
     int m_maxOutputTokens = 16000;
@@ -70,4 +72,12 @@ private:
     int m_keepRecentImages = 3;
 
     bool m_printCot = true; // surface intermediate reasoning/text to the user
+
+    // Sent as the User-Agent header of every request, e.g.
+    // "tapto-code/1.0.5 (d8c8383; windows)", so a proxy in front of the
+    // provider (LiteLLM, a corporate gateway) can see which program and
+    // version is calling, and turn away one that is too old. Empty sends
+    // no header of ours and leaves the HTTP library's default. The program
+    // names itself, not the library.
+    std::string m_userAgent;
 };

@@ -3,7 +3,8 @@
 
 // Unit tests for the parts of libtapto that need no provider on the other end:
 // the config store, secret references, UTF-8 sanitising, tool images, the
-// /compact trimmer and the tool display hook. Plain assertions; ctest runs
+// /compact trimmer and the tool display hook, plus the headers the provider
+// clients send, checked against a local server. Plain assertions; ctest runs
 // the binary.
 
 #include <cstdio>
@@ -13,7 +14,9 @@
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <memory>
 #include <string>
+#include <thread>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -22,14 +25,18 @@
 #  include <windows.h>
 #endif
 
+#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include "tapto/aibackend.h"
 #include "tapto/base64.h"
 #include "tapto/certs.h"
+#include "tapto/claude.h"
 #include "tapto/config.h"
 #include "tapto/context.h"
 #include "tapto/encoding.h"
+#include "tapto/gemini.h"
+#include "tapto/openai.h"
 #include "tapto/fstools.h"
 #include "tapto/policy.h"
 #include "tapto/provider.h"
@@ -1033,6 +1040,80 @@ void test_certificates() {
     fs::remove_all(dir);
 }
 
+// --- User-Agent -------------------------------------------------------------
+
+// One real request per dialect against a local server that answers each with
+// the smallest reply the client accepts and records the User-Agent it got. A
+// proxy in front of the provider tells programs and versions apart by this
+// header, so what arrives on the wire is what is checked, not the config.
+void test_user_agent_sent() {
+    httplib::Server server;
+    std::string seen;
+    bool had_header = false;
+    server.Post(R"(.*)", [&](const httplib::Request& req, httplib::Response& res) {
+        had_header = req.has_header("User-Agent");
+        seen = req.get_header_value("User-Agent");
+        json reply;
+        if (req.path == "/v1/messages") {
+            reply = {{"content", json::array({{{"type", "text"}, {"text", "ok"}}})},
+                     {"stop_reason", "end_turn"},
+                     {"usage", {{"input_tokens", 1}, {"output_tokens", 1}}}};
+        } else if (req.path == "/v1/chat/completions") {
+            reply = {{"choices", json::array({{{"message", {{"role", "assistant"}, {"content", "ok"}}},
+                                              {"finish_reason", "stop"}}})},
+                     {"usage", {{"prompt_tokens", 1}, {"completion_tokens", 1}}}};
+        } else {
+            reply = {{"candidates", json::array({{{"content", {{"role", "model"},
+                                                              {"parts", json::array({{{"text", "ok"}}})}}},
+                                                 {"finishReason", "STOP"}}})},
+                     {"usageMetadata", {{"promptTokenCount", 1}}}};
+        }
+        res.set_content(reply.dump(), "application/json");
+    });
+    const int port = server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    if (port <= 0) return;
+    std::thread listener([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    auto ask = [&](const AiConfig& cfg, const std::string& dialect) {
+        std::unique_ptr<AiBackend> client;
+        if (dialect == "claude") client = std::make_unique<ClaudeClient>(&cfg, url, "m", "k");
+        else if (dialect == "openai") client = std::make_unique<OpenAIClient>(&cfg, url, "m", "k");
+        else client = std::make_unique<GeminiClient>(&cfg, url, "m", "k");
+        client->start();
+        Context ctx;
+        seen.clear();
+        had_header = false;
+        try {
+            client->chat(ctx, "hi");
+        } catch (const std::exception& e) {
+            std::cerr << dialect << ": " << e.what() << "\n";
+            CHECK(false);
+        }
+    };
+
+    AiConfig named;
+    named.setUserAgent("tapto-test/9.9.9 (abc1234; testos)");
+    for (const char* dialect : {"claude", "openai", "gemini"}) {
+        ask(named, dialect);
+        CHECK(had_header);
+        CHECK_EQ(seen, std::string("tapto-test/9.9.9 (abc1234; testos)"));
+    }
+
+    // Unset: none of ours. Whatever the HTTP library sends by default is its
+    // business; it must not be a program name the library made up.
+    AiConfig unnamed;
+    for (const char* dialect : {"claude", "openai", "gemini"}) {
+        ask(unnamed, dialect);
+        CHECK(seen.rfind("tapto", 0) != 0);
+    }
+
+    server.stop();
+    listener.join();
+}
+
 } // namespace
 
 int main() {
@@ -1059,6 +1140,7 @@ int main() {
     test_folder_set_home();
     test_folder_tools();
     test_certificates();
+    test_user_agent_sent();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed\n";

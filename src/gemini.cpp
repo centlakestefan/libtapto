@@ -144,6 +144,7 @@ nlohmann::json GeminiClient::call_gemini(
         { "Content-Type", "application/json" },
         { "x-goog-api-key", api_key }
     };
+    if (!m_config->userAgent().empty()) headers.emplace("User-Agent", m_config->userAgent());
 
     std::string body_str = request_body.dump();
 

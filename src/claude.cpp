@@ -158,6 +158,7 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
         {"anthropic-version", "2023-06-01"},
         {"content-type", "application/json"}
     };
+    if (!m_config->userAgent().empty()) headers.emplace("User-Agent", m_config->userAgent());
 
     int connection_retry_count = 0;
     int rate_limit_retries = 0;

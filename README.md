@@ -17,7 +17,7 @@ Apache-2.0. C++17. Windows, Linux and macOS.
 include(FetchContent)
 FetchContent_Declare(libtapto
   GIT_REPOSITORY https://github.com/centlakestefan/libtapto.git
-  GIT_TAG        v0.1.0          # pin a tag; never a branch
+  GIT_TAG        v0.2.0          # pin a tag; never a branch
 )
 FetchContent_MakeAvailable(libtapto)
 
