@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <system_error>
 
@@ -176,6 +177,9 @@ std::string label_for(const fs::path& root, const std::vector<Folder>& taken) {
     std::string base = root.filename().string();
     if (base.empty()) base = root.root_name().string(); // "C:" for a drive root
     if (base.empty()) base = "folder";
+    // '@' starts the program's own labels (add_system), so a grant's never
+    // does: a folder named "@types" is labelled "_types".
+    if (base[0] == '@') base[0] = '_';
     std::string label = base;
     for (int n = 2;; ++n) {
         bool clash = false;
@@ -196,12 +200,43 @@ std::string granted_list(const std::vector<Folder>& folders) {
     std::string out = has_home ? "Reachable folders:" : "Granted folders:";
     for (const auto& f : folders) {
         out += "\n  " + f.label + "  ->  " + f.root.generic_string() +
-               (f.home ? "  (working directory)" : "");
+               (f.home ? "  (working directory)" : "") +
+               (f.system && !f.note.empty() ? "  (" + f.note + ")" : "");
     }
     return out;
 }
 
 } // namespace
+
+std::string FolderSet::add_system(const std::string& label, const std::string& path,
+                                  bool writable, const std::string& note) {
+    if (label.size() < 2 || label[0] != '@' ||
+        label.find_first_of("/\\ \t") != std::string::npos) {
+        return "ERROR: '" + label + "' is not a program folder's label (\"@name\").";
+    }
+    for (const auto& f : m_folders) {
+        if (f.label == label) return "ERROR: the label '" + label + "' is in use.";
+    }
+    std::error_code ec;
+    const fs::path given(path);
+    if (!fs::is_directory(given, ec)) return "ERROR: '" + path + "' is not a directory.";
+
+    Folder f;
+    f.root = canonical_or_normal(fs::absolute(given, ec));
+    f.label = label;
+    f.writable = writable;
+    f.system = true;
+    f.note = note;
+    m_folders.push_back(std::move(f));
+    return "";
+}
+
+bool FolderSet::has_grants() const {
+    for (const auto& f : m_folders) {
+        if (!f.home && !f.system) return true;
+    }
+    return false;
+}
 
 std::string FolderSet::set_home(const std::string& path, bool writable) {
     if (path.empty()) return "ERROR: no folder given.";
@@ -211,9 +246,12 @@ std::string FolderSet::set_home(const std::string& path, bool writable) {
     if (!fs::is_directory(given, ec)) return "ERROR: '" + path + "' is not a directory.";
 
     const fs::path root = canonical_or_normal(fs::absolute(given, ec));
-    // A previous home goes, and so does any grant the new one covers.
+    // A previous home goes, and so does any grant the new one covers; the
+    // program's own folders stay, wherever they are.
     m_folders.erase(std::remove_if(m_folders.begin(), m_folders.end(),
-                                   [&](const Folder& f) { return f.home || is_within(root, f.root); }),
+                                   [&](const Folder& f) {
+                                       return f.home || (!f.system && is_within(root, f.root));
+                                   }),
                     m_folders.end());
 
     Folder f;
@@ -227,7 +265,7 @@ std::string FolderSet::set_home(const std::string& path, bool writable) {
 
 void FolderSet::clear() {
     m_folders.erase(std::remove_if(m_folders.begin(), m_folders.end(),
-                                   [](const Folder& f) { return !f.home; }),
+                                   [](const Folder& f) { return !f.home && !f.system; }),
                     m_folders.end());
 }
 
@@ -243,10 +281,19 @@ const Folder* FolderSet::find(const std::string& path_or_label) const {
 }
 
 const Folder* FolderSet::owner_of(const fs::path& canonical) const {
+    // The deepest root wins: a program folder under the home root (the home
+    // folder started in) owns what is under it, with its own mode.
+    const Folder* best = nullptr;
+    std::size_t best_depth = 0;
     for (const auto& f : m_folders) {
-        if (is_within(f.root, canonical)) return &f;
+        if (!is_within(f.root, canonical)) continue;
+        const auto depth = static_cast<std::size_t>(std::distance(f.root.begin(), f.root.end()));
+        if (!best || depth > best_depth) {
+            best = &f;
+            best_depth = depth;
+        }
     }
-    return nullptr;
+    return best;
 }
 
 std::string FolderSet::add(const std::string& path, std::string* label_out, bool writable) {
@@ -275,14 +322,14 @@ std::string FolderSet::add(const std::string& path, std::string* label_out, bool
 
 bool FolderSet::set_writable(const std::string& path_or_label, bool writable) {
     const Folder* f = find(path_or_label);
-    if (!f || f->home) return false;
+    if (!f || f->home || f->system) return false;
     m_folders[static_cast<size_t>(f - m_folders.data())].writable = writable;
     return true;
 }
 
 bool FolderSet::remove(const std::string& path_or_label) {
     const Folder* f = find(path_or_label);
-    if (!f || f->home) return false;
+    if (!f || f->home || f->system) return false;
     m_folders.erase(m_folders.begin() + (f - m_folders.data()));
     return true;
 }
@@ -315,7 +362,12 @@ bool FolderSet::resolve(const std::string& input,
         // label happens to match one of its subfolders cannot shadow them.
         const Folder* h = home();
         std::error_code ec;
-        if (h && fs::exists(h->root / candidate, ec)) {
+        if (by_label && by_label->system) {
+            // A program folder's '@' label is never shadowed.
+            fs::path rest;
+            for (auto it = std::next(candidate.begin()); it != candidate.end(); ++it) rest /= *it;
+            abs = by_label->root / rest;
+        } else if (h && fs::exists(h->root / candidate, ec)) {
             abs = h->root / candidate;
         } else if (by_label) {
             fs::path rest;
@@ -418,6 +470,7 @@ std::string tool_list_folders(const FolderSet& folders) {
         for (const auto& f : folders.folders()) {
             out += "\n  " + f.label + "  ->  " + f.root.generic_string() + "  (" +
                    (f.home ? "working directory, " : "") +
+                   (f.system && !f.note.empty() ? f.note + ", " : "") +
                    (f.writable ? "read and write" : "read-only") + ")";
         }
         return out;
@@ -693,7 +746,9 @@ std::vector<ToolSpec> folder_tools(const FolderSet& folders) {
 std::string folder_prompt(const FolderSet& folders) {
     if (!folders.has_grants()) return "";
     bool any_writable = false;
-    for (const auto& f : folders.folders()) any_writable = any_writable || (f.writable && !f.home);
+    for (const auto& f : folders.folders()) {
+        any_writable = any_writable || (f.writable && !f.home && !f.system);
+    }
 
     // A program with a working directory of its own: the grants come on top
     // of it, and the paragraph says the folder tools reach it too -- a model
@@ -703,7 +758,7 @@ std::string folder_prompt(const FolderSet& folders) {
             "The user has granted you access to these folders on their machine, beyond "
             "your working directory:\n";
         for (const auto& f : folders.folders()) {
-            if (f.home) continue;
+            if (f.home || f.system) continue;
             out += "  " + f.label + "  (" + f.root.generic_string() + ")" +
                    (f.writable ? "  -- read and write" : "  -- read-only") + "\n";
         }

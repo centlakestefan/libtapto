@@ -874,6 +874,70 @@ void test_folder_set_home() {
     }
 }
 
+// A program's own folders ("@tmp"): reached by their '@' label, which nothing
+// shadows; not grants, so they stay put; and the owner of their paths even
+// when the home root holds them too.
+void test_folder_system() {
+    Tree t("folders-system");
+    tapto::FolderSet set;
+    fs::path out;
+    std::string err;
+    const fs::path tmp = t.root / "proj" / "state" / "tmp";
+    fs::create_directories(tmp);
+    Tree::write(tmp / "out.txt", "overflow\n");
+
+    CHECK_EQ(set.set_home((t.root / "proj").string(), /*writable=*/true), std::string(""));
+    CHECK(starts_with(set.add_system("tmp", tmp.string(), false, "x"), "ERROR:"));
+    CHECK(starts_with(set.add_system("@", tmp.string(), false, "x"), "ERROR:"));
+    CHECK(starts_with(set.add_system("@a/b", tmp.string(), false, "x"), "ERROR:"));
+    CHECK(starts_with(set.add_system("@nope", (t.root / "nope").string(), false, "x"), "ERROR:"));
+    CHECK_EQ(set.add_system("@tmp", tmp.string(), false, "long tool output"), std::string(""));
+    CHECK(starts_with(set.add_system("@tmp", tmp.string(), false, "again"), "ERROR:"));
+
+    // Not a grant.
+    CHECK(!set.has_grants());
+    CHECK(tapto::folder_prompt(set).empty());
+    CHECK(!set.remove("@tmp"));
+    CHECK(!set.set_writable("@tmp", true));
+    set.clear();
+    CHECK(set.get("@tmp") != nullptr);
+
+    // By label, and by absolute path; it owns its paths although the home
+    // (proj) holds them too, so its mode is the one that applies.
+    const tapto::Folder* owner = nullptr;
+    CHECK(set.resolve("@tmp/out.txt", out, err, &owner));
+    CHECK(fs::equivalent(out, tmp / "out.txt"));
+    CHECK(owner && owner->system && !owner->writable);
+    CHECK(set.resolve((tmp / "out.txt").string(), out, err, &owner));
+    CHECK(owner && owner->label == "@tmp");
+    CHECK_EQ(set.display(tmp / "out.txt"), std::string("@tmp/out.txt"));
+
+    // A working-directory entry named "@tmp" does not shadow it.
+    fs::create_directories(t.root / "proj" / "@tmp");
+    Tree::write(t.root / "proj" / "@tmp" / "out.txt", "decoy\n");
+    CHECK(set.resolve("@tmp/out.txt", out, err));
+    CHECK(fs::equivalent(out, tmp / "out.txt"));
+
+    // A grant of a folder named like one is labelled without the '@'.
+    std::string label;
+    CHECK_EQ(set.add((t.root / "proj" / "@tmp").string(), &label), std::string(""));
+    CHECK_EQ(label, std::string("proj")); // covered by the home already
+    fs::create_directories(t.root / "@types");
+    CHECK_EQ(set.add((t.root / "@types").string(), &label), std::string(""));
+    CHECK_EQ(label, std::string("_types"));
+
+    // A new home keeps it; list_folders names it with its note and mode.
+    CHECK_EQ(set.set_home((t.root / "other").string()), std::string(""));
+    CHECK(set.get("@tmp") != nullptr);
+    const std::string listed = run(tapto::folder_tools(set), "list_folders", json::object());
+    CHECK(contains(listed, "@tmp"));
+    CHECK(contains(listed, "long tool output, read-only"));
+    // The prompt lists the grant, not the program's folder.
+    const std::string prompt = tapto::folder_prompt(set);
+    CHECK(contains(prompt, "_types"));
+    CHECK(!contains(prompt, "@tmp"));
+}
+
 void test_folder_tools() {
     Tree t("folders-tools");
     tapto::FolderSet set;
@@ -1138,6 +1202,7 @@ int main() {
     test_folder_set_grants();
     test_folder_set_resolve();
     test_folder_set_home();
+    test_folder_system();
     test_folder_tools();
     test_certificates();
     test_user_agent_sent();

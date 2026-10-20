@@ -44,6 +44,11 @@ struct Folder {
     // The program's own working directory, set with FolderSet::set_home: always
     // first in the set, never removed, its mode never changed.
     bool home = false;
+    // A folder of the program's own, added with FolderSet::add_system under a
+    // label that starts with '@' (tapto-code's "@tmp", "@memory"): never
+    // removed, its mode never changed, not a grant. `note` says what it holds.
+    bool system = false;
+    std::string note;
 };
 
 class FolderSet {
@@ -68,6 +73,17 @@ public:
     // calls this behaves exactly as before.
     std::string set_home(const std::string& path, bool writable = false);
 
+    // Add a folder of the program's own under a fixed label, which must start
+    // with '@' (a grant's label never does) and be unused; the directory must
+    // exist. Like the home root it is not a grant: remove(), set_writable()
+    // and clear() leave it alone, has_grants() and folder_prompt() do not
+    // count it (the program explains its own folders), and set_home() keeps
+    // it. Unlike a grant's, its label wins over a working-directory entry of
+    // the same name, and a path under it belongs to it even when the home root
+    // covers it too. Returns an empty string on success, else "ERROR: ...".
+    std::string add_system(const std::string& label, const std::string& path, bool writable,
+                           const std::string& note);
+
     // The home root, or null when the program has none.
     const Folder* home() const {
         return !m_folders.empty() && m_folders.front().home ? &m_folders.front() : nullptr;
@@ -88,10 +104,16 @@ public:
     // grants in the order they were made.
     const std::vector<Folder>& folders() const { return m_folders; }
     bool empty() const { return m_folders.empty(); }
-    // True when the user has granted something, the home root not counted.
-    bool has_grants() const { return m_folders.size() > (home() ? 1u : 0u); }
-    // Revoke every grant. The home root stays.
+    // True when the user has granted something, the home root and the
+    // program's own folders not counted.
+    bool has_grants() const;
+    // Revoke every grant. The home root and the program's folders stay.
     void clear();
+
+    // The folder that holds `path` (already canonical): the deepest root that
+    // contains it, so a program folder inside the home root owns its paths.
+    // Null when none does.
+    const Folder* owner(const std::filesystem::path& canonical) const { return owner_of(canonical); }
 
     // Resolve a model-supplied path to a real one inside a granted root.
     //
