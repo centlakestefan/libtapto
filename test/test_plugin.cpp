@@ -15,6 +15,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -230,6 +231,19 @@ void test_module(const std::string& path, bool has_unload) {
         CHECK_EQ(call(plugin, "test_wrong_heap", "{}", r), scom::OK);
         r.reset();
         CHECK_EQ(g_host.foreign_frees, before + 1);
+    }
+
+    // The smart pointers' copies and moves keep the count right.
+    {
+        scom::Ptr<tapto::ITaptoPlugin> a(plugin.get()), b;
+        b = a;                      // copy: two references more than `plugin`
+        scom::Ptr<tapto::ITaptoPlugin> c(std::move(a));
+        CHECK(!a && c.get() == plugin.get());
+        b = std::move(c);           // move-assign: b's old reference released
+        CHECK(!c && b.get() == plugin.get());
+        scom::QIPtr<tapto::ITaptoPluginPrompt> q;
+        q = scom::QIPtr<tapto::ITaptoPluginPrompt>(plugin.get());
+        CHECK(q);
     }
 
     // The optional interfaces, by QueryInterface.

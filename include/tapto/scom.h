@@ -36,6 +36,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 #if defined(_WIN32) && !defined(_WIN64)
 #  define SCOM_CALL __stdcall
@@ -211,7 +212,7 @@ public:
     }
     Ptr& operator=(const Ptr& o) { return *this = o.m_p; }
     Ptr& operator=(Ptr&& o) noexcept {
-        if (this != &o) {
+        if (this != std::addressof(o)) { // & is overloaded, for out parameters
             Release();
             m_p = o.m_p;
             o.m_p = nullptr;
