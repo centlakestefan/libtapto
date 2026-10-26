@@ -211,6 +211,37 @@ if(LIBTAPTO_BUILD_TESTS)
     target_compile_options(test-libtapto PRIVATE -Wall -Wextra)
   endif()
   add_test(NAME libtapto COMMAND test-libtapto)
+
+  # The plugin boundary (tapto/plugin.h): a test plugin built twice, with and
+  # without ITaptoPluginUnload, and a host that loads both. The plugin links
+  # only the headers, since that is all a plugin gets; the host needs nothing
+  # of the library but nlohmann_json to read Describe.
+  foreach(_variant IN ITEMS unload nounload)
+    add_library(tapto-test-plugin-${_variant} MODULE test/plugin/test_plugin.cpp)
+    target_include_directories(tapto-test-plugin-${_variant} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_compile_features(tapto-test-plugin-${_variant} PRIVATE cxx_std_17)
+    set_target_properties(tapto-test-plugin-${_variant} PROPERTIES
+      PREFIX "" CXX_VISIBILITY_PRESET hidden)
+    if(MSVC)
+      target_compile_options(tapto-test-plugin-${_variant} PRIVATE /W4 /EHsc /utf-8)
+    else()
+      target_compile_options(tapto-test-plugin-${_variant} PRIVATE -Wall -Wextra)
+    endif()
+  endforeach()
+  target_compile_definitions(tapto-test-plugin-unload PRIVATE TEST_PLUGIN_UNLOAD)
+
+  add_executable(test-plugin test/test_plugin.cpp)
+  target_include_directories(test-plugin PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(test-plugin PRIVATE nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+  add_dependencies(test-plugin tapto-test-plugin-unload tapto-test-plugin-nounload)
+  if(MSVC)
+    target_compile_options(test-plugin PRIVATE /W4 /EHsc /utf-8)
+  else()
+    target_compile_options(test-plugin PRIVATE -Wall -Wextra)
+  endif()
+  add_test(NAME plugin COMMAND test-plugin
+    $<TARGET_FILE:tapto-test-plugin-unload> $<TARGET_FILE:tapto-test-plugin-nounload>)
   # Where OpenSSL is a pair of DLLs that nothing has put on PATH (the
   # FireDaemon fetch above; a Shining Light install that skipped the PATH
   # entry) the test dies at load time with STATUS_DLL_NOT_FOUND and no output.

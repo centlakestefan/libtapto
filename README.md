@@ -38,6 +38,16 @@ this library and defines none of them will not link.
 `test/ui_null.cpp` is a do-nothing implementation. Link it in tests, or in any
 program with no UI of its own.
 
+### Plugins: `tapto/plugin.h`
+
+The plugin boundary, header-only: the interfaces a plugin module (a DLL or
+SO) implements and the host it talks to, over `tapto/scom.h` (sCom, vendored
+from cpr). JSON crosses it, strings come from the host's heap, and no STL
+crosses, so a plugin needs only these two headers and a C ABI, whatever
+compiler builds it. A plugin does not link `tapto::tapto`; add the include
+directory alone. `test/plugin/test_plugin.cpp` is a minimal plugin, and
+`test/test_plugin.cpp` loads it the way a host does.
+
 ### Dependencies
 
 Fetched and pinned here, so every program moves together when they are bumped:
