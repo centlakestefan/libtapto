@@ -84,6 +84,13 @@ public:
     std::string add_system(const std::string& label, const std::string& path, bool writable,
                            const std::string& note);
 
+    // Take a program folder away again, or change its mode: the program's
+    // own calls for its own folders (tapto-code's plugin folders come and go
+    // with the plugin), never reached through remove() or set_writable(),
+    // which a user's command calls. False when no program folder has `label`.
+    bool remove_system(const std::string& label);
+    bool set_system_writable(const std::string& label, bool writable);
+
     // The home root, or null when the program has none.
     const Folder* home() const {
         return !m_folders.empty() && m_folders.front().home ? &m_folders.front() : nullptr;

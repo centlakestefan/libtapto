@@ -936,6 +936,19 @@ void test_folder_system() {
     const std::string prompt = tapto::folder_prompt(set);
     CHECK(contains(prompt, "_types"));
     CHECK(!contains(prompt, "@tmp"));
+
+    // Only the program's own calls change or remove it, and only by label.
+    CHECK(!set.set_system_writable("_types", true));
+    CHECK(!set.remove_system("_types"));
+    CHECK(set.set_system_writable("@tmp", true));
+    CHECK(set.get("@tmp")->writable);
+    CHECK(set.remove_system("@tmp"));
+    CHECK(set.get("@tmp") == nullptr);
+    CHECK(!set.remove_system("@tmp"));
+    // The label is gone: the path is now an entry of the home root (other).
+    const tapto::Folder* gone = nullptr;
+    CHECK(!set.resolve("@tmp/out.txt", out, err, &gone) || (gone && gone->home));
+    CHECK_EQ(set.add_system("@tmp", tmp.string(), false, "back"), std::string(""));
 }
 
 void test_folder_tools() {

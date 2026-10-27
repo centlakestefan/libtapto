@@ -31,6 +31,10 @@
 // corrupts memory instead of failing to link. A plugin needs only a C ABI, so
 // any compiler, and any language with a C FFI, can build one.
 //
+// Every string is UTF-8, paths included, and no exception may leave a call
+// across the boundary: a plugin catches its own and reports them in its
+// result.
+//
 // --- Lifetime -----------------------------------------------------------------
 //
 // The host calls TaptoGetPlugin once, after loading the module, and keeps the
@@ -102,7 +106,8 @@ SCOM_DEFINE_IID(ITaptoHost, 0x2924b32e, 0x5182, 0x4042, 0x98, 0xa1, 0x7c, 0x61, 
 //     "version": "1.0.0",
 //     "prompt": "...",                 // optional, fixed system-prompt text
 //     "config_keys": ["jira-url", {"name": "jira-api-token", "secret": true}],
-//     "folders": [{"name": "cache", "mode": "rw"}],     // optional
+//     "folder": "rw",                  // optional, "ro" or "rw": a folder
+//                                      // of the plugin's own, per project
 //     "tools": [{
 //       "name": "image_read",          // must start with "<name>_"
 //       "description": "...",
@@ -114,10 +119,18 @@ SCOM_DEFINE_IID(ITaptoHost, 0x2924b32e, 0x5182, 0x4042, 0x98, 0xa1, 0x7c, 0x61, 
 //       "writes": false                // true: offered only when loaded rw
 //     }]
 //   }
+//
+// A plugin's folder is reached by the model as "@<name>" (the plugin's name),
+// with the host's path rules and its editor, so the plugin need not offer
+// file tools of its own. It is read-only when the folder says "ro" or the
+// plugin is loaded ro. The host makes it, and passes it to Configure.
 struct ITaptoPlugin : scom::IBase {
     virtual SRESULT SCOM_CALL Describe(char*& json_out) = 0;
     // An object of the plugin's config keys, secrets already resolved by the
-    // host. Called before the first CallTool, and again when one changes.
+    // host. Called before the first CallTool, and again when one changes or
+    // the plugin's mode does. A plugin with a folder also finds it there,
+    // under a name no config key can have:
+    //   "folder": {"path": "<absolute>", "label": "@<name>", "writable": true}
     virtual SRESULT SCOM_CALL Configure(const char* json_config) = 0;
     // `json_args` is the model's arguments, path arguments replaced by the
     // checked absolute path. `result_out` is the text the model gets; a tool

@@ -231,6 +231,24 @@ std::string FolderSet::add_system(const std::string& label, const std::string& p
     return "";
 }
 
+bool FolderSet::remove_system(const std::string& label) {
+    for (auto it = m_folders.begin(); it != m_folders.end(); ++it) {
+        if (!it->system || it->label != label) continue;
+        m_folders.erase(it);
+        return true;
+    }
+    return false;
+}
+
+bool FolderSet::set_system_writable(const std::string& label, bool writable) {
+    for (auto& f : m_folders) {
+        if (!f.system || f.label != label) continue;
+        f.writable = writable;
+        return true;
+    }
+    return false;
+}
+
 bool FolderSet::has_grants() const {
     for (const auto& f : m_folders) {
         if (!f.home && !f.system) return true;
