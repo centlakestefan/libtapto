@@ -97,6 +97,33 @@ struct ITaptoHost : scom::IBase {
 SCOM_DEFINE_IID(ITaptoHost, 0x2924b32e, 0x5182, 0x4042, 0x98, 0xa1, 0x7c, 0x61, 0x6a,
                 0x32, 0xa3, 0x85)
 
+// Found on the host by QueryInterface: secrets a plugin finds in its own
+// settings, and secrets it keeps between sessions.
+struct ITaptoHostSecrets : scom::IBase {
+    // Resolves `ref`, from the plugin's own settings rather than a config key
+    // it declared secret (a file of server definitions, say), the way the
+    // host resolves such a key: "env:NAME", "cmd:<command>",
+    // "wincred:<target>", or a plain value, which is the secret itself. Only
+    // during Configure or RunCommand (both read the user's settings at the
+    // user's word); ERR_BAD_CONTEXT outside them. ERR_NOT_FOUND when a
+    // reference cannot be resolved, and then `value_out` is the reason, for
+    // the plugin's own message.
+    virtual SRESULT SCOM_CALL ResolveSecret(const char* ref, char*& value_out) = 0;
+
+    // A secret the plugin keeps between sessions (a token it was given at a
+    // login), in the user's secret store: Windows Credential Manager, a file
+    // only the user can read elsewhere. Each plugin has its own names, so it
+    // reaches no other plugin's and no credential of the user's. `name` is
+    // [A-Za-z0-9._-], at most 64; an empty `value` forgets it. During
+    // Configure, CallTool or RunCommand; ERR_BAD_CONTEXT outside them.
+    virtual SRESULT SCOM_CALL StoreSecret(const char* name, const char* value) = 0;
+    // What StoreSecret kept under `name`; ERR_NOT_FOUND when nothing is.
+    virtual SRESULT SCOM_CALL LoadSecret(const char* name, char*& value_out) = 0;
+};
+// {64DF3181-B47F-49C9-86B6-54FA53702042}
+SCOM_DEFINE_IID(ITaptoHostSecrets, 0x64df3181, 0xb47f, 0x49c9, 0x86, 0xb6, 0x54, 0xfa,
+                0x53, 0x70, 0x20, 0x42)
+
 // The plugin itself, what TaptoGetPlugin hands out.
 //
 // Describe's JSON:
@@ -108,6 +135,10 @@ SCOM_DEFINE_IID(ITaptoHost, 0x2924b32e, 0x5182, 0x4042, 0x98, 0xa1, 0x7c, 0x61, 
 //     "config_keys": ["jira-url", {"name": "jira-api-token", "secret": true}],
 //     "folder": "rw",                  // optional, "ro" or "rw": a folder
 //                                      // of the plugin's own, per project
+//     "command": {"usage": "...", "description": "..."}, // optional: the
+//                                      // command /<name>, see
+//                                      // ITaptoPluginCommands
+//     "events": ["before_turn"],       // optional: see ITaptoPluginEvents
 //     "tools": [{
 //       "name": "image_read",          // must start with "<name>_"
 //       "description": "...",
@@ -131,6 +162,10 @@ struct ITaptoPlugin : scom::IBase {
     // the plugin's mode does. A plugin with a folder also finds it there,
     // under a name no config key can have:
     //   "folder": {"path": "<absolute>", "label": "@<name>", "writable": true}
+    // Every plugin finds its place among the user's settings, a folder the
+    // host neither makes nor lets the model reach, for files of the user's
+    // own that the plugin reads (a list of servers, say):
+    //   "user_folder": "<absolute>"
     virtual SRESULT SCOM_CALL Configure(const char* json_config) = 0;
     // `json_args` is the model's arguments, path arguments replaced by the
     // checked absolute path. `result_out` is the text the model gets; a tool
@@ -160,6 +195,61 @@ struct ITaptoPluginPrompt : scom::IBase {
 // {D93075D6-02D3-4566-8B2D-2C94BC3DD0D4}
 SCOM_DEFINE_IID(ITaptoPluginPrompt, 0xd93075d6, 0x02d3, 0x4566, 0x8b, 0x2d, 0x2c, 0x94,
                 0xbc, 0x3d, 0xd0, 0xd4)
+
+// Optional: tools known only once the plugin is configured (a bridge to
+// servers it connects to in Configure). Asked for after every Configure,
+// CallTool, RunCommand and OnEvent, since those may change them (a server that wants a
+// login again, a login); the JSON array it hands out replaces Describe's
+// "tools", in the same shape and under the same rules. A host takes a change
+// made by a call from the model's next turn. A failed call leaves the plugin
+// with no tools.
+struct ITaptoPluginTools : scom::IBase {
+    virtual SRESULT SCOM_CALL Tools(char*& json_out) = 0;
+};
+// {84BCF703-90E0-4B71-9056-596BFB228620}
+SCOM_DEFINE_IID(ITaptoPluginTools, 0x84bcf703, 0x90e0, 0x4b71, 0x90, 0x56, 0x59, 0x6b,
+                0xfb, 0x22, 0x86, 0x20)
+
+// Optional: what happens in the host, for a plugin that subscribed to it in
+// Describe ("events": ["before_turn"]); only those events reach it, so an
+// event added to a later host never surprises an older plugin. Each is run
+// as a RunCommand is (the per-call host functions and secrets work). OK when
+// the plugin's tools or prompt may have changed, and the host asks for them
+// again; ST_FALSE when nothing did. `text_out`, when set, is printed to the
+// user.
+//
+// Events are notifications: one never decides what the host does. A plugin
+// that takes a decision over (runs a command elsewhere, say) does it through
+// an interface of its own.
+//
+// The events, with what `json` holds:
+//
+//   before_turn  {}  before each of the model's turns, after the user's
+//                    message is in. A plugin whose own settings changed on
+//                    disk (a file it reads) takes them in here; it should
+//                    cost nothing when nothing changed, a stat, not a read.
+struct ITaptoPluginEvents : scom::IBase {
+    virtual SRESULT SCOM_CALL OnEvent(const char* event, const char* json, char*& text_out) = 0;
+};
+// {2D438FD3-248A-4D88-B23D-7C76DF25ECB4}
+SCOM_DEFINE_IID(ITaptoPluginEvents, 0x2d438fd3, 0x248a, 0x4d88, 0xb2, 0x3d, 0x7c, 0x76, 0xdf,
+                0x25, 0xec, 0xb4)
+
+// Optional: a command the user types, "/<name> <args>", named after the
+// plugin so it can shadow neither the host's commands nor another plugin's.
+// Describe says it has one:
+//   "command": {"usage": "/mcp list | login <server>", "description": "..."}
+// `args` is the rest of the line, trimmed; `text_out` is printed to the user
+// and never reaches the model. The host runs it as it runs a CallTool, so the
+// per-call host functions work (IsCancelled: ESC), and asks for the tools
+// and the prompt again after it. An error status is for a command the plugin
+// could not run at all; one that fails says so in its text.
+struct ITaptoPluginCommands : scom::IBase {
+    virtual SRESULT SCOM_CALL RunCommand(const char* args, char*& text_out) = 0;
+};
+// {D2BBA127-9AE5-4BFC-B861-7BA9A7E470B0}
+SCOM_DEFINE_IID(ITaptoPluginCommands, 0xd2bba127, 0x9ae5, 0x4bfc, 0xb8, 0x61, 0x7b, 0xa9,
+                0xa7, 0xe4, 0x70, 0xb0)
 
 // --- The module's exports -----------------------------------------------------
 

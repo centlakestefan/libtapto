@@ -12,6 +12,11 @@
 //   test_image      attaches a 1x1 PNG through the host
 //   test_outside    calls the host's per-call functions from Describe's
 //                   caller instead, see `g_outside`
+//
+// ITaptoPluginTools adds test_configured once Configure has run, described
+// by what the host's ResolveSecret made of the config's "test-ref".
+// ITaptoPluginCommands runs /test, echoing its arguments; ITaptoPluginEvents
+// takes before_turn and says something before the first turn only.
 
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +32,8 @@ namespace {
 // What IsCancelled returned when Describe (not a call) asked: the host must
 // refuse it outside a CallTool. Reported by test_outside.
 SRESULT g_outside = -1;
+// What ResolveSecret returned when Describe asked: refused outside Configure.
+SRESULT g_secret_outside = -1;
 
 // A valid 1x1 RGBA PNG.
 const uint8_t kPng[] = {
@@ -55,7 +62,10 @@ class Plugin : public scom::Base,
 #ifdef TEST_PLUGIN_UNLOAD
                public tapto::ITaptoPluginUnload,
 #endif
-               public tapto::ITaptoPluginPrompt {
+               public tapto::ITaptoPluginPrompt,
+               public tapto::ITaptoPluginTools,
+               public tapto::ITaptoPluginCommands,
+               public tapto::ITaptoPluginEvents {
 public:
     SCOM_IMPLEMENT_BASE_EX(Plugin, tapto::ITaptoPlugin)
     SCOM_BEGIN_INTERFACE_MAP(Plugin)
@@ -64,15 +74,21 @@ public:
         SCOM_INTERFACE(tapto::ITaptoPluginUnload)
 #endif
         SCOM_INTERFACE(tapto::ITaptoPluginPrompt)
+        SCOM_INTERFACE(tapto::ITaptoPluginTools)
+        SCOM_INTERFACE(tapto::ITaptoPluginCommands)
+        SCOM_INTERFACE(tapto::ITaptoPluginEvents)
     SCOM_END_INTERFACE_MAP()
 
     SRESULT SCOM_CALL Describe(char*& json_out) override {
         g_outside = tapto::plugin_host()->IsCancelled();
+        g_secret_outside = resolve("env:X", m_secret);
         return hand_out(R"({
   "name": "test",
   "version": "0.0.1",
   "prompt": "The test plugin is loaded.",
   "config_keys": ["test-url", {"name": "test-token", "secret": true}],
+  "command": {"usage": "/test <words>", "description": "Echo the words."},
+  "events": ["before_turn"],
   "tools": [
     {"name": "test_echo", "description": "Echo the arguments.",
      "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
@@ -93,6 +109,21 @@ public:
     SRESULT SCOM_CALL Configure(const char* json_config) override {
         if (!json_config) return scom::ERR_BAD_ARGUMENT;
         m_config = json_config;
+        // The config is JSON; this plugin only looks for one plain string.
+        const std::string key = "\"test-ref\":\"";
+        const std::size_t at = m_config.find(key);
+        if (at != std::string::npos) {
+            const std::size_t b = at + key.size(), e = m_config.find('"', b);
+            const SRESULT r = resolve(m_config.substr(b, e - b), m_secret);
+            m_secret = std::to_string(r) + ":" + m_secret;
+            // Kept between sessions, and read back as the host has it.
+            scom::QIPtr<tapto::ITaptoHostSecrets> s(tapto::plugin_host());
+            if (s && s->StoreSecret("kept", m_secret.c_str()) == scom::OK) {
+                TaptoString back;
+                if (s->LoadSecret("kept", back.out()) == scom::OK) m_secret = back.str();
+            }
+        }
+        m_configured = true;
         return scom::OK;
     }
 
@@ -120,7 +151,8 @@ public:
             return hand_out(r == scom::OK ? "attached" : "ERROR: attach refused", result_out);
         }
         if (tool == "test_outside")
-            return hand_out(std::to_string(g_outside), result_out);
+            return hand_out(std::to_string(g_outside) + " " + std::to_string(g_secret_outside),
+                            result_out);
         return hand_out("ERROR: no tool " + tool, result_out);
     }
 
@@ -135,12 +167,47 @@ public:
         return hand_out("prompt #" + std::to_string(++m_prompts), text_out);
     }
 
+    // before_turn: changes nothing, and says so once, before the first.
+    SRESULT SCOM_CALL OnEvent(const char* event, const char* json, char*& text_out) override {
+        if (!event || std::string(event) != "before_turn" || !json) return scom::ST_FALSE;
+        if (m_refreshed++) return scom::ST_FALSE;
+        return hand_out("refreshed", text_out);
+    }
+
+    SRESULT SCOM_CALL Tools(char*& json_out) override {
+        if (!m_configured) return hand_out("[]", json_out);
+        return hand_out(R"([{"name": "test_configured", "description": ")" + m_secret +
+                            R"(", "schema": {"type": "object"}}])",
+                        json_out);
+    }
+
+    // /test <args>: the words back, and whether the host counts it as a call.
+    SRESULT SCOM_CALL RunCommand(const char* args, char*& text_out) override {
+        const SRESULT c = tapto::plugin_host()->IsCancelled();
+        return hand_out(std::string("ran ") + (args ? args : "") +
+                            (c == scom::ERR_BAD_CONTEXT ? " outside a call" : ""),
+                        text_out);
+    }
+
 private:
     ~Plugin() { release_host(); }
+
+    // ResolveSecret through the host's optional interface.
+    static SRESULT resolve(const std::string& ref, std::string& value) {
+        scom::QIPtr<tapto::ITaptoHostSecrets> s(tapto::plugin_host());
+        if (!s) return scom::ERR_NOINTERFACE;
+        TaptoString v;
+        const SRESULT r = s->ResolveSecret(ref.c_str(), v.out());
+        value = v.str();
+        return r;
+    }
 
     tapto::PluginObjectCount m_count;
     std::string m_config = "{}";
     int m_prompts = 0;
+    bool m_configured = false;
+    int m_refreshed = 0;
+    std::string m_secret;
 };
 
 } // namespace
