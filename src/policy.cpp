@@ -2,6 +2,7 @@
 // Copyright 2026 Centlake Software AB
 
 #include "tapto/policy.h"
+#include "tapto/program.h"
 
 #include <algorithm>
 #include <cctype>
@@ -336,8 +337,15 @@ bool policy_confines_providers(const std::vector<Config::Entry>& policy) {
     return v && is_false(*v);
 }
 
+// For the running program: the policy sets the key all programs share, or the
+// program's own. A key with another program's prefix is managed when the
+// policy sets it, or the shared one it overrides.
 bool is_policy_managed(const std::string& key) {
-    return find(policy_entries(), key).has_value();
+    const auto policy = policy_entries();
+    std::string program;
+    const std::string base = split_program_key(key, &program);
+    if (find(policy, key) || find(policy, base)) return true;
+    return program.empty() && find(policy, program_name() + "." + key).has_value();
 }
 
 bool policy_allows_user_commands() {

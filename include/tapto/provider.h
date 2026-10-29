@@ -38,10 +38,19 @@ struct EffectiveEntry {
     std::string key;
     std::string value;
     Level origin;
+    // Set from the running program's own key at that level
+    // ("tapto-word.print-cot"), not the one all programs share.
+    bool program_key = false;
 };
 
 // Merge all scopes lowest-to-highest so later scopes override earlier ones,
 // while preserving first-seen ordering of keys.
+//
+// Within one scope a key with the running program's prefix
+// ("tapto-word.print-cot", see tapto/program.h) overrides the shared one
+// ("print-cot"), and comes out under the shared name; another program's keys
+// are left out. A shared key at a more specific scope still beats a program
+// key at a less specific one.
 std::vector<EffectiveEntry> effective_config();
 
 // Look up a config key's effective value across all scopes. A key present but

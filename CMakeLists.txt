@@ -135,6 +135,7 @@ add_library(tapto STATIC
   src/program.cpp
   src/overflow.cpp
   src/plugins.cpp
+  src/chat_commands.cpp
   src/certs.cpp
   src/tool_image.cpp
 )

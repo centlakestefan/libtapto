@@ -29,7 +29,9 @@
 #include <nlohmann/json.hpp>
 
 #include "tapto/aibackend.h"
+#include "tapto/aiconfig.h"
 #include "tapto/base64.h"
+#include "tapto/chat_commands.h"
 #include "tapto/certs.h"
 #include "tapto/claude.h"
 #include "tapto/config.h"
@@ -38,6 +40,7 @@
 #include "tapto/encoding.h"
 #include "tapto/gemini.h"
 #include "tapto/openai.h"
+#include "tapto/paths.h"
 #include "tapto/pathrules.h"
 #include "tapto/program.h"
 #include "tapto/fstools.h"
@@ -1264,6 +1267,154 @@ void test_editor_without_home() {
     tapto::set_program_name("tapto");
 }
 
+// Settings per program and the shared commands, in a home of their own: a
+// program key overrides the shared one at its scope and comes out under the
+// shared name, another program's is left out, a more specific scope's shared
+// key still wins; the scope flags; a write lands on the key that set the
+// value there; and /cot, /effort and the folder commands as a program runs
+// them.
+void test_program_keys_and_commands() {
+    const fs::path home = scratch_file("home-chat");
+    fs::remove_all(home);
+    fs::create_directories(home);
+    const char* home_var =
+#ifdef _WIN32
+        "USERPROFILE";
+#else
+        "HOME";
+#endif
+    auto env = [](const char* name, const std::string& value) {
+#ifdef _WIN32
+        _putenv_s(name, value.c_str());
+#else
+        setenv(name, value.c_str(), 1);
+#endif
+    };
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    const char* old_home_raw = std::getenv(home_var);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    const std::string old_home = old_home_raw ? old_home_raw : "";
+    env(home_var, home.string());
+    tapto::set_program_name("tapto-word");
+
+    const fs::path global = tapto::config_path(tapto::Level::Global);
+    const fs::path project = tapto::config_path(tapto::Level::Local);
+    {
+        tapto::Config g = tapto::Config::load(global);
+        g.set("print-cot", "true");
+        g.set("tapto-word.print-cot", "false");
+        g.set("tapto-code.model", "for-code-only");
+        g.set("tapto-wrod.model", "a-typo");
+        g.save(global);
+    }
+    auto find = [](const std::string& key) -> const tapto::EffectiveEntry* {
+        static std::vector<tapto::EffectiveEntry> all;
+        all = tapto::effective_config();
+        for (const auto& e : all)
+            if (e.key == key) return &e;
+        return nullptr;
+    };
+    // The program's own key wins at its scope, under the shared name.
+    const tapto::EffectiveEntry* cot = find("print-cot");
+    CHECK(cot && cot->value == "false" && cot->program_key && cot->origin == tapto::Level::Global);
+    CHECK(find("tapto-word.print-cot") == nullptr);
+    // Another program's key is not this one's; a misspelt prefix is no
+    // program's, so it stays a key of its own.
+    CHECK(find("model") == nullptr && find("tapto-code.model") == nullptr);
+    CHECK(find("tapto-wrod.model") != nullptr);
+    CHECK_EQ(tapto::setting_origin("print-cot"), std::string("global config, for tapto-word only"));
+    // A shared key in the project's config beats a program key in the global one.
+    {
+        tapto::Config pc = tapto::Config::load(project);
+        pc.set("print-cot", "true");
+        pc.save(project);
+    }
+    cot = find("print-cot");
+    CHECK(cot && cot->value == "true" && !cot->program_key && cot->origin == tapto::Level::Local);
+    CHECK_EQ(tapto::setting_origin("print-cot"), std::string("project config, for all programs"));
+    CHECK_EQ(tapto::split_program_key("tapto-vnc.plugin.mcp"), std::string("plugin.mcp"));
+    CHECK_EQ(tapto::split_program_key("plugin.mcp"), std::string("plugin.mcp"));
+
+    // The scope flags: anywhere, or before the first word only.
+    auto f = tapto::parse_scope_flags("--global off");
+    CHECK(f.scope == tapto::SettingScope::Global && f.rest == "off" && f.error.empty());
+    f = tapto::parse_scope_flags("off --session");
+    CHECK(f.scope == tapto::SettingScope::Session && f.rest == "off");
+    f = tapto::parse_scope_flags("--global x --project");
+    CHECK(!f.error.empty());
+    f = tapto::parse_scope_flags("--global build make --global", /*leading_only=*/true);
+    CHECK(f.scope == tapto::SettingScope::Global && f.rest == "build make --global");
+
+    // A write goes to the key that set the value at that scope.
+    tapto::SettingWrite w = tapto::write_setting("print-cot", std::string("true"),
+                                                 tapto::SettingScope::Global);
+    CHECK(w.ok && w.text == "global config, for tapto-word only");
+    CHECK_EQ(tapto::Config::load(global).get("tapto-word.print-cot").value_or(""), std::string("true"));
+    CHECK_EQ(tapto::Config::load(global).get("print-cot").value_or(""), std::string("true"));
+
+    // The commands.
+    AiConfig ai;
+    tapto::FolderSet folders;
+    int rebuilt = 0;
+    tapto::ChatCommands c;
+    c.ai = &ai;
+    c.folders = &folders;
+    c.provider_name = "local";
+    c.provider_dialect = "claude";
+    c.folders_changed = [&] { ++rebuilt; };
+    auto run = [&](const std::string& line) {
+        const auto r = tapto::run_chat_command(line, c);
+        return r ? (r->error ? "ERR " : "") + r->text : std::string("(not a command)");
+    };
+    CHECK_EQ(run("/cotton"), std::string("(not a command)"));
+    CHECK_EQ(run("hello"), std::string("(not a command)"));
+    ai.setPrintCot(true);
+    CHECK_EQ(run("/cot"), std::string("CoT output: on (project config, for all programs)"));
+    CHECK_EQ(run("/cot off --session"), std::string("CoT output off for this session."));
+    CHECK(!ai.printCot());
+    CHECK_EQ(run("/cot"), std::string("CoT output: off (this session)"));
+    CHECK_EQ(run("/cot --global off"), std::string("CoT output off (global config, for tapto-word only)."));
+    // Unset at the project: the global config's tapto-word key applies again.
+    CHECK_EQ(run("/cot unset --project"),
+             std::string("CoT output: off (global config, for tapto-word only)"));
+    CHECK(!tapto::Config::load(project).get("print-cot"));
+    CHECK(starts_with(run("/cot maybe"), "ERR usage: /cot"));
+    CHECK(starts_with(run("/cot on --global --project"), "ERR Give one scope"));
+
+    // /effort: the openai dialect alone; the project's config by default.
+    CHECK(starts_with(run("/effort high"), "ERR /effort only applies to the openai dialect"));
+    c.provider_dialect = "openai";
+    CHECK_EQ(run("/effort high"), std::string("local-reasoning-effort = high (project config, for all programs)."));
+    CHECK_EQ(tapto::Config::load(project).get("local-reasoning-effort").value_or(""), std::string("high"));
+    CHECK_EQ(run("/effort"), std::string("local-reasoning-effort = high (project config, for all programs)"));
+    CHECK(starts_with(run("/effort unset"), "local-reasoning-effort removed from the project config; unset now"));
+    CHECK(ai.openaiReasoningEffort().empty());
+
+    // The folders: for this session only, never saved.
+    const fs::path grant = home / "grant";
+    fs::create_directories(grant);
+    CHECK(starts_with(run("/add-folder " + grant.string() + " --global"), "ERR A folder is granted for this session only"));
+    c.rw_folders = false;
+    CHECK(starts_with(run("/add-folder " + grant.string() + " rw"), "ERR tapto-word grants folders read-only"));
+    c.rw_folders = true;
+    CHECK(starts_with(run("/add-folder " + grant.string() + " rw"), "Granted read-write access"));
+    CHECK_EQ(rebuilt, 1);
+    CHECK(contains(run("/list-folders"), "grant  ->"));
+    CHECK(starts_with(run("/remove-folder grant"), "Revoked 'grant'. The model reaches no folder now."));
+    CHECK_EQ(rebuilt, 2);
+    CHECK(starts_with(run("/clear"), "ERR /clear is not available here."));
+    CHECK(contains(tapto::chat_commands_help(c), "/add-folder <path> [ro|rw]"));
+
+    tapto::set_program_name("tapto");
+    env(home_var, old_home);
+    fs::remove_all(home);
+}
+
 int main() {
     test_config_roundtrip();
     test_config_preserves_file();
@@ -1289,6 +1440,7 @@ int main() {
     test_folder_system();
     test_folder_tools();
     test_editor_without_home();
+    test_program_keys_and_commands();
     test_certificates();
     test_user_agent_sent();
 

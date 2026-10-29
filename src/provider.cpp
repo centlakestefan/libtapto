@@ -2,6 +2,7 @@
 // Copyright 2026 Centlake Software AB
 
 #include "tapto/provider.h"
+#include "tapto/program.h"
 
 #include <cstdlib>
 
@@ -123,18 +124,29 @@ Secret resolve_api_key(const std::string& name, const std::string& dialect) {
 std::vector<EffectiveEntry> effective_config() {
     std::vector<EffectiveEntry> merged;
 
-    auto apply = [&](const std::vector<Config::Entry>& entries, Level level) {
-        for (const auto& entry : entries) {
-            bool found = false;
-            for (auto& existing : merged) {
-                if (existing.key == entry.first) {
-                    existing.value = entry.second;
-                    existing.origin = level;
-                    found = true;
-                    break;
-                }
+    auto put = [&](const std::string& key, const std::string& value, Level level,
+                   bool program_key) {
+        for (auto& existing : merged) {
+            if (existing.key == key) {
+                existing.value = value;
+                existing.origin = level;
+                existing.program_key = program_key;
+                return;
             }
-            if (!found) merged.push_back({entry.first, entry.second, level});
+        }
+        merged.push_back({key, value, level, program_key});
+    };
+    // The shared keys of a scope, then this program's own, which override
+    // them there; another program's are not this one's.
+    auto apply = [&](const std::vector<Config::Entry>& entries, Level level) {
+        std::string program;
+        for (const auto& entry : entries) {
+            split_program_key(entry.first, &program);
+            if (program.empty()) put(entry.first, entry.second, level, false);
+        }
+        for (const auto& entry : entries) {
+            const std::string key = split_program_key(entry.first, &program);
+            if (!program.empty() && program == program_name()) put(key, entry.second, level, true);
         }
     };
 
