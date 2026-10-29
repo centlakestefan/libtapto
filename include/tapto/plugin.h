@@ -164,8 +164,9 @@ struct ITaptoPlugin : scom::IBase {
     //   "folder": {"path": "<absolute>", "label": "@<name>", "writable": true}
     // Every plugin finds its place among the user's settings, a folder the
     // host neither makes nor lets the model reach, for files of the user's
-    // own that the plugin reads (a list of servers, say):
-    //   "user_folder": "<absolute>"
+    // own that the plugin reads (a list of servers, say), and the program it
+    // runs in, for what it tells the user ("tapto-word config set ..."):
+    //   "user_folder": "<absolute>", "program": "tapto-word"
     virtual SRESULT SCOM_CALL Configure(const char* json_config) = 0;
     // `json_args` is the model's arguments, path arguments replaced by the
     // checked absolute path. `result_out` is the text the model gets; a tool
