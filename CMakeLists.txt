@@ -130,6 +130,9 @@ add_library(tapto STATIC
   src/policy.cpp
   src/encoding.cpp
   src/fstools.cpp
+  src/pathrules.cpp
+  src/editor.cpp
+  src/program.cpp
   src/certs.cpp
   src/tool_image.cpp
 )

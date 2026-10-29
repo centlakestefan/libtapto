@@ -34,9 +34,12 @@
 #include "tapto/claude.h"
 #include "tapto/config.h"
 #include "tapto/context.h"
+#include "tapto/editor.h"
 #include "tapto/encoding.h"
 #include "tapto/gemini.h"
 #include "tapto/openai.h"
+#include "tapto/pathrules.h"
+#include "tapto/program.h"
 #include "tapto/fstools.h"
 #include "tapto/policy.h"
 #include "tapto/provider.h"
@@ -1193,6 +1196,74 @@ void test_user_agent_sent() {
 
 } // namespace
 
+// The editor in a program without a working directory (tapto-word): a path
+// is a label's or an absolute one, a read-only grant is read and never
+// written, a read-write one is written but not its git directory, and what
+// the library says names the program.
+void test_editor_without_home() {
+    Tree t("editor-no-home");
+    tapto::set_program_name("tapto-test");
+    tapto::FolderSet set;
+    const char* kEdit = "str_replace_based_edit_tool";
+    auto view = [&](const std::string& path) {
+        return run(tapto::editor_tools(set), kEdit, json{{"command", "view"}, {"path", path}});
+    };
+    auto create = [&](const std::string& path) {
+        return run(tapto::editor_tools(set), kEdit,
+                   json{{"command", "create"}, {"path", path}, {"file_text", "made\n"}});
+    };
+
+    CHECK_EQ(tapto::editor_tools(set).size(), std::size_t(2));
+    std::string r = view("x.txt");
+    CHECK(starts_with(r, "ERROR:") && contains(r, "has granted none"));
+
+    std::string ro, rw;
+    CHECK_EQ(set.add((t.root / "proj").string(), &ro, /*writable=*/false), std::string());
+    CHECK_EQ(set.add((t.root / "other").string(), &rw, /*writable=*/true), std::string());
+    const auto tools = tapto::editor_tools(set);
+    CHECK(contains(tools[0].description,
+                   "This tool reaches the folders the user granted and tapto-test's own"));
+
+    // A relative path has nothing to be relative to.
+    r = view("src/main.cpp");
+    CHECK(starts_with(r, "ERROR:") && contains(r, "<label>/<path>"));
+    // By label, and by absolute path.
+    CHECK(contains(view(ro + "/src/main.cpp"), "int main()"));
+    CHECK(contains(view((t.root / "proj" / "README.md").string()), "Hello world."));
+    // Outside every grant.
+    CHECK(starts_with(view((t.root / "elsewhere.txt").string()), "ERROR:"));
+
+    // Read-only: refused, with the mode named; nothing written.
+    r = create(ro + "/new.txt");
+    CHECK(starts_with(r, "ERROR:") && contains(r, "read-only"));
+    CHECK(!fs::exists(t.root / "proj" / "new.txt"));
+    // Read-write: written.
+    r = create(rw + "/made.txt");
+    CHECK(!starts_with(r, "ERROR:"));
+    CHECK(fs::exists(t.root / "other" / "made.txt"));
+    // Never its git directory.
+    fs::create_directories(t.root / "other" / ".git");
+    r = create(rw + "/.git/config");
+    CHECK(starts_with(r, "ERROR:") && contains(r, "git directory") &&
+          contains(r, "tapto-test never writes"));
+
+    // find_files names hits by label, which the editor takes back.
+    r = run(tools, "find_files", json{{"filename", "*.txt"}, {"path", rw}});
+    CHECK(contains(r, (rw + "/made.txt").c_str()));
+
+    // A plugin's path argument: by the same rules.
+    const tapto::PathRules rules(set);
+    CHECK(rules.root().empty());
+    fs::path out;
+    std::string display, error;
+    CHECK(rules.resolve_plugin_path(rw + "/made.txt", true, out, display, error));
+    CHECK_EQ(display, rw + "/made.txt");
+    CHECK(!rules.resolve_plugin_path(ro + "/README.md", true, out, display, error));
+    CHECK(rules.resolve_plugin_path(ro + "/README.md", false, out, display, error));
+
+    tapto::set_program_name("tapto");
+}
+
 int main() {
     test_config_roundtrip();
     test_config_preserves_file();
@@ -1217,6 +1288,7 @@ int main() {
     test_folder_set_home();
     test_folder_system();
     test_folder_tools();
+    test_editor_without_home();
     test_certificates();
     test_user_agent_sent();
 
