@@ -1713,7 +1713,7 @@ bool valid_server_name(const std::string& n) {
     return true;
 }
 
-class McpPlugin : public scom::Base,
+class McpPlugin final : public scom::Base,
                   public tapto::ITaptoPlugin,
                   public tapto::ITaptoPluginUnload,
                   public tapto::ITaptoPluginPrompt,

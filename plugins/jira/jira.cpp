@@ -826,7 +826,7 @@ void release_host() {
     }
 }
 
-class JiraPlugin : public scom::Base,
+class JiraPlugin final : public scom::Base,
                    public tapto::ITaptoPlugin,
                    public tapto::ITaptoPluginUnload,
                    public tapto::ITaptoPluginPrompt {

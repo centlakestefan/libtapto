@@ -37,6 +37,12 @@
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4996 4244 4245 4100 4456 4457 4702)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
 #endif
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -44,6 +50,8 @@
 #include "stb_image_write.h"
 #ifdef _MSC_VER
 #pragma warning(pop)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 #include <cstdlib>

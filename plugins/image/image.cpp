@@ -48,6 +48,14 @@
 #pragma warning(push)
 #pragma warning(disable : 4996) // stb_image_write.h uses sprintf internally
 #pragma warning(disable : 4244 4245 4100 4456 4457 4702) // stb's own conversions
+#elif defined(__GNUC__)
+// stb's own code, as GCC and Clang see it: struct initializers that leave
+// members out, unused parameters and the like. Not ours to change.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
 #endif
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -59,6 +67,8 @@
 #include "stb_image_write.h"
 #ifdef _MSC_VER
 #pragma warning(pop)
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 namespace fs = std::filesystem;
@@ -226,7 +236,7 @@ void release_host() {
     }
 }
 
-class ImagePlugin : public scom::Base,
+class ImagePlugin final : public scom::Base,
                     public tapto::ITaptoPlugin,
                     public tapto::ITaptoPluginUnload {
 public:

@@ -237,7 +237,7 @@ std::string memory_prompt(const fs::path& folder, const std::string& label, bool
     return prompt;
 }
 
-class MemoryPlugin : public scom::Base,
+class MemoryPlugin final : public scom::Base,
                      public tapto::ITaptoPlugin,
                      public tapto::ITaptoPluginUnload,
                      public tapto::ITaptoPluginPrompt {

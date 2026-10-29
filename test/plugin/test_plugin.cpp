@@ -57,7 +57,7 @@ void release_host() {
     }
 }
 
-class Plugin : public scom::Base,
+class Plugin final : public scom::Base,
                public tapto::ITaptoPlugin,
 #ifdef TEST_PLUGIN_UNLOAD
                public tapto::ITaptoPluginUnload,

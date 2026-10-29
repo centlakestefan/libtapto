@@ -53,7 +53,7 @@ void release_host() {
     }
 }
 
-class Probe : public scom::Base,
+class Probe final : public scom::Base,
               public tapto::ITaptoPlugin,
               public tapto::ITaptoPluginUnload,
               public tapto::ITaptoPluginPrompt {

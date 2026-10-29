@@ -277,7 +277,7 @@ std::string skills_prompt(const fs::path& folder, const std::string& label) {
     return prompt;
 }
 
-class SkillsPlugin : public scom::Base,
+class SkillsPlugin final : public scom::Base,
                      public tapto::ITaptoPlugin,
                      public tapto::ITaptoPluginUnload,
                      public tapto::ITaptoPluginPrompt {

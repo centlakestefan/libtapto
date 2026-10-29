@@ -138,7 +138,11 @@ protected:
     std::atomic<int32_t> m_ref;
 };
 
-#define SCOM_IMPLEMENT_BASE_EX(obj, baseIfc)                                     \
+// The object deletes itself in Release(), as the class that uses the macro, so
+// nothing may derive from that class: declare it `final`, which is also what
+// tells GCC so (else -Wdelete-non-virtual-dtor: Base's destructor is protected,
+// not virtual).
+#define SCOM_IMPLEMENT_BASE_EX(obj, baseIfc)                                    \
     ::scom::SRESULT SCOM_CALL QueryInterface(const ::scom::GUID& riid,           \
                                              void** ppv) override {              \
         if (!ppv) return ::scom::ERR_BAD_ARGUMENT;                               \
