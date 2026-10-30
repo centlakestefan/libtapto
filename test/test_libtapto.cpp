@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <memory>
 #include <string>
@@ -1303,6 +1304,80 @@ void test_editor_without_home() {
     tapto::set_program_name("tapto");
 }
 
+// A document open in an editor: one map entry per file, holding its text.
+struct FakeBuffers : tapto::Buffers {
+    std::map<fs::path, std::string> open;
+    bool refuse = false;
+    Result read(const fs::path& path, std::string& text, std::string&) override {
+        const auto it = open.find(path);
+        if (it == open.end()) return Result::NotOpen;
+        text = it->second;
+        return Result::Done;
+    }
+    Result write(const fs::path& path, const std::string& text, std::string& error) override {
+        const auto it = open.find(path);
+        if (it == open.end()) return Result::NotOpen;
+        if (refuse) {
+            error = "the document is read-only";
+            return Result::Failed;
+        }
+        it->second = text;
+        return Result::Done;
+    }
+};
+
+// The editor reads and writes an open document in place of its file, and the
+// disk for everything else.
+void test_editor_buffers() {
+    Tree t("editor-buffers");
+    tapto::FolderSet set;
+    CHECK_EQ(set.set_home((t.root / "proj").string(), /*writable=*/true), std::string());
+    auto buffers = std::make_shared<FakeBuffers>();
+    const tapto::PathRules rules(set);
+    fs::path main_cpp;
+    std::string err;
+    CHECK(rules.resolve_for_editor("src/main.cpp", main_cpp, err));
+    buffers->open[main_cpp] = "int main() {\r\n  return 1; // unsaved\r\n}\r\n";
+    const auto tools = tapto::editor_tools(set, buffers);
+    auto edit = [&](json in) { return run(tools, "str_replace_based_edit_tool", std::move(in)); };
+    auto on_disk = [&](const fs::path& p) {
+        std::ifstream in(p, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    const std::string disk = on_disk(main_cpp);
+
+    // view shows the editor's text, unsaved changes and all.
+    std::string r = edit({{"command", "view"}, {"path", "src/main.cpp"}});
+    CHECK(contains(r, "2|  return 1; // unsaved"));
+    // str_replace and insert change the document, in its own line endings.
+    r = edit({{"command", "str_replace"}, {"path", "src/main.cpp"},
+              {"old_str", "  return 1; // unsaved\n}"}, {"new_str", "  return 2;\n}"}});
+    CHECK_EQ(r, std::string("OK"));
+    r = edit({{"command", "insert"}, {"path", "src/main.cpp"}, {"insert_line", 0},
+              {"new_str", "#include <cstdio>"}});
+    CHECK(!starts_with(r, "ERROR:"));
+    CHECK_EQ(buffers->open[main_cpp],
+             std::string("#include <cstdio>\r\nint main() {\r\n  return 2;\r\n}\r\n"));
+    r = edit({{"command", "write"}, {"path", "src/main.cpp"}, {"file_text", "int x;\n"}});
+    CHECK(!starts_with(r, "ERROR:"));
+    CHECK_EQ(buffers->open[main_cpp], std::string("int x;\n"));
+    CHECK_EQ(on_disk(main_cpp), disk);
+
+    // A document that refuses the edit says so; the file is not written instead.
+    buffers->refuse = true;
+    r = edit({{"command", "str_replace"}, {"path", "src/main.cpp"},
+              {"old_str", "int x;"}, {"new_str", "int y;"}});
+    CHECK(starts_with(r, "ERROR:") && contains(r, "read-only"));
+    CHECK_EQ(buffers->open[main_cpp], std::string("int x;\n"));
+    CHECK_EQ(on_disk(main_cpp), disk);
+
+    // A file no document holds is the disk's.
+    r = edit({{"command", "str_replace"}, {"path", "README.md"},
+              {"old_str", "Hello world."}, {"new_str", "Hello disk."}});
+    CHECK_EQ(r, std::string("OK"));
+    CHECK(contains(on_disk(t.root / "proj" / "README.md"), "Hello disk."));
+}
+
 // Settings per program and the shared commands, in a home of their own: a
 // program key overrides the shared one at its scope and comes out under the
 // shared name, another program's is left out, a more specific scope's shared
@@ -1478,6 +1553,7 @@ int main() {
     test_folder_system();
     test_folder_tools();
     test_editor_without_home();
+    test_editor_buffers();
     test_program_keys_and_commands();
     test_certificates();
     test_user_agent_sent();

@@ -138,9 +138,44 @@ bool write_file(const fs::path& path, const std::string& content) {
     return out.good();
 }
 
+// The text of `path`, from the document that holds it when there is one, else
+// from the file. False when it cannot be had: `error` says why when a document
+// refused, and is empty when the file is missing or unreadable, for the caller
+// to say which.
+bool load(Buffers* buffers, const fs::path& path, std::string& content, std::string& error) {
+    error.clear();
+    if (buffers) {
+        switch (buffers->read(path, content, error)) {
+            case Buffers::Result::Done: return true;
+            case Buffers::Result::Failed:
+                if (error.empty()) error = "the open document could not be read";
+                return false;
+            case Buffers::Result::NotOpen: error.clear(); break;
+        }
+    }
+    return read_file(path, content);
+}
+
+// Write `content` to the document that holds `path`, or else to the file.
+// The returned error is empty on success.
+std::string store(Buffers* buffers, const fs::path& path, const std::string& content) {
+    std::string error;
+    if (buffers) {
+        switch (buffers->write(path, content, error)) {
+            case Buffers::Result::Done: return {};
+            case Buffers::Result::Failed:
+                return "ERROR: Failed to write " + path.string() + ": " +
+                       (error.empty() ? std::string("the open document refused the edit") : error);
+            case Buffers::Result::NotOpen: break;
+        }
+    }
+    if (!write_file(path, content)) return "ERROR: Failed to write " + path.string();
+    return {};
+}
+
 // --- text editor tool -----------------------------------------------------
 
-std::string execute_text_editor(const PathRules& rules, const json& in) {
+std::string execute_text_editor(const PathRules& rules, Buffers* buffers, const json& in) {
     try {
         if (!in.contains("command")) return "ERROR: 'command' not present.";
         std::string command = in["command"];
@@ -174,24 +209,34 @@ std::string execute_text_editor(const PathRules& rules, const json& in) {
                     return sandbox_err;
                 }
             }
-            std::error_code ec;
-            if (!fs::exists(path, ec)) return "ERROR: File not found: " + path.string();
-
-            if (fs::is_directory(path, ec)) {
-                std::vector<std::string> entries;
-                for (const auto& e : fs::directory_iterator(path, ec)) {
-                    std::string name = e.path().filename().string();
-                    if (e.is_directory(ec)) name += "/";
-                    entries.push_back(name);
-                }
-                std::sort(entries.begin(), entries.end());
-                std::ostringstream out;
-                for (const auto& name : entries) out << name << "\n";
-                return out.str();
+            // An open document is shown as it is in the editor, whether or
+            // not it has been saved, or even exists on disk yet.
+            std::string content, error;
+            const Buffers::Result held =
+                buffers ? buffers->read(path, content, error) : Buffers::Result::NotOpen;
+            if (held == Buffers::Result::Failed) {
+                return "ERROR: Failed to read " + path.string() + ": " +
+                       (error.empty() ? std::string("the open document could not be read") : error);
             }
+            if (held == Buffers::Result::NotOpen) {
+                std::error_code ec;
+                if (!fs::exists(path, ec)) return "ERROR: File not found: " + path.string();
 
-            std::string content;
-            if (!read_file(path, content)) return "ERROR: Failed to read " + path.string();
+                if (fs::is_directory(path, ec)) {
+                    std::vector<std::string> entries;
+                    for (const auto& e : fs::directory_iterator(path, ec)) {
+                        std::string name = e.path().filename().string();
+                        if (e.is_directory(ec)) name += "/";
+                        entries.push_back(name);
+                    }
+                    std::sort(entries.begin(), entries.end());
+                    std::ostringstream out;
+                    for (const auto& name : entries) out << name << "\n";
+                    return out.str();
+                }
+
+                if (!read_file(path, content)) return "ERROR: Failed to read " + path.string();
+            }
             // Numbering a binary file would put NULs and invalid UTF-8 into the
             // model's context and the chat transcript, which the UTF-8
             // sanitizer downstream cannot catch — they are valid UTF-8. cat,
@@ -301,8 +346,9 @@ std::string execute_text_editor(const PathRules& rules, const json& in) {
             if (fs::is_directory(path, ec)) {
                 return "ERROR: '" + path.string() + "' is a directory.";
             }
-            if (!write_file(path, in["file_text"].get<std::string>())) {
-                return "ERROR: Failed to write " + path.string();
+            if (const std::string err = store(buffers, path, in["file_text"].get<std::string>());
+                !err.empty()) {
+                return err;
             }
             // Echo the path as the model gave it, as the other commands' errors
             // do not: the resolved one is absolute and machine-specific.
@@ -357,8 +403,9 @@ std::string execute_text_editor(const PathRules& rules, const json& in) {
                     return sandbox_err;
                 }
             }
-            std::string content;
-            if (!read_file(path, content)) {
+            std::string content, error;
+            if (!load(buffers, path, content, error)) {
+                if (!error.empty()) return "ERROR: Failed to read " + path.string() + ": " + error;
                 return "ERROR: File not found: " + path.string() + ". Use the create command to create it.";
             }
             std::string old_str = in["old_str"].get<std::string>();
@@ -389,7 +436,7 @@ std::string execute_text_editor(const PathRules& rules, const json& in) {
             const std::string style =
                 eol_style(content.substr(begin, end - begin), eol_style(content, "\n"));
             content.replace(begin, end - begin, with_eol(new_str, style));
-            if (!write_file(path, content)) return "ERROR: Failed to write " + path.string();
+            if (const std::string err = store(buffers, path, content); !err.empty()) return err;
             return "OK";
         }
 
@@ -405,8 +452,10 @@ std::string execute_text_editor(const PathRules& rules, const json& in) {
                     return sandbox_err;
                 }
             }
-            std::string content;
-            if (!read_file(path, content)) return "ERROR: Failed to read " + path.string();
+            std::string content, error;
+            if (!load(buffers, path, content, error)) {
+                return "ERROR: Failed to read " + path.string() + (error.empty() ? "" : ": " + error);
+            }
 
             int insert_line = in["insert_line"];
             std::string new_str = in["new_str"].get<std::string>();
@@ -429,7 +478,7 @@ std::string execute_text_editor(const PathRules& rules, const json& in) {
             } else {
                 content.insert(offset, piece + eol);
             }
-            if (!write_file(path, content)) return "ERROR: Failed to write " + path.string();
+            if (const std::string err = store(buffers, path, content); !err.empty()) return err;
             return "Insertion successful at line " + std::to_string(insert_line);
         }
 
@@ -608,7 +657,7 @@ std::string display_find_files(const json& input) {
 
 } // namespace
 
-std::vector<ToolSpec> editor_tools(const FolderSet& folders) {
+std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buffers> buffers) {
     std::vector<ToolSpec> tools;
     const PathRules rules(folders);
 
@@ -665,7 +714,9 @@ std::vector<ToolSpec> editor_tools(const FolderSet& folders) {
         }},
         {"required", {"command", "path"}},
     };
-    editor.executor = [rules](Context&, const json& in) { return execute_text_editor(rules, in); };
+    editor.executor = [rules, buffers](Context&, const json& in) {
+        return execute_text_editor(rules, buffers.get(), in);
+    };
     editor.display = display_text_editor;
     tools.push_back(std::move(editor));
 
