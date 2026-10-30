@@ -772,6 +772,42 @@ void test_folder_set_resolve() {
     CHECK(set.resolve("other/secret.txt", out, err));
 }
 
+// A program hosted by another process (an IDE extension) names its project
+// folder rather than changing the process's working directory: the local
+// scope and relative folders follow it, and an empty path goes back.
+void test_project_dir() {
+    Tree t("project-dir");
+    const fs::path cwd_config = tapto::config_path(tapto::Level::Local);
+    CHECK(fs::equivalent(tapto::project_dir(), fs::current_path()));
+
+    tapto::set_project_dir(t.root / "proj");
+    CHECK(fs::equivalent(tapto::project_dir(), t.root / "proj"));
+    const fs::path proj_config = tapto::config_path(tapto::Level::Local);
+    CHECK(proj_config != cwd_config);
+    CHECK(contains(proj_config.string(), "project-dir"));
+
+    tapto::FolderSet set;
+    CHECK_EQ(set.set_home(".", /*writable=*/true), std::string(""));
+    CHECK(set.home() && fs::equivalent(set.home()->root, t.root / "proj"));
+    std::string label;
+    CHECK_EQ(set.add("../other", &label), std::string(""));
+    CHECK_EQ(label, std::string("other"));
+    CHECK(set.remove("../other"));
+    CHECK(starts_with(set.add(""), "ERROR:"));
+
+    tapto::set_project_dir({});
+    CHECK(fs::equivalent(tapto::project_dir(), fs::current_path()));
+    CHECK(tapto::config_path(tapto::Level::Local) == cwd_config);
+}
+
+// The program's own file is the test executable: the library is linked into
+// it, not into a DLL.
+void test_program_file() {
+    const fs::path file = tapto::program_file();
+    CHECK(!file.empty());
+    CHECK(file.stem() == "test-libtapto");
+}
+
 // A program with a working directory of its own names it the home root: the
 // folder tools reach it, relative paths land in it, and it is not a grant.
 void test_folder_set_home() {
@@ -1437,6 +1473,8 @@ int main() {
     test_folder_set_grants();
     test_folder_set_resolve();
     test_folder_set_home();
+    test_project_dir();
+    test_program_file();
     test_folder_system();
     test_folder_tools();
     test_editor_without_home();

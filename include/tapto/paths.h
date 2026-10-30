@@ -18,10 +18,19 @@ enum class Level { System, Global, Local, Policy };
 // Human-readable name ("system" / "global" / "local" / "policy").
 const char* level_name(Level level);
 
+// The project folder: the one the local scope belongs to, and what a relative
+// folder the user names (/add-folder) is relative to. The process's working
+// directory unless the program names another: a program loaded into someone
+// else's process (an IDE extension in devenv.exe) cannot change that
+// directory, and its project can change while it runs. An empty path goes back
+// to the working directory. Safe to call from any thread.
+void set_project_dir(const std::filesystem::path& dir);
+std::filesystem::path project_dir();
+
 // Resolve the config file path for a scope.
 //
 // System and Global are fixed per-machine / per-user. Local (project) scope is
-// stored centrally per working directory under the user's home
+// stored centrally per project folder (project_dir()) under the user's home
 // (~/.tapto/projects/<encoded-cwd>/config), NOT inside the project folder —
 // so a cloned repo can't ship config/commands and nothing is written into the
 // project tree. No upward search.

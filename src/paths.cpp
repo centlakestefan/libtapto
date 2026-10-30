@@ -4,6 +4,7 @@
 #include "tapto/paths.h"
 
 #include <cstdlib>
+#include <mutex>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -59,18 +60,30 @@ std::string project_key(const fs::path& dir) {
     return key;
 }
 
-// The project (local) scope is stored centrally per working directory under the
+fs::path canonical_or_given(const fs::path& p) {
+    std::error_code ec;
+    fs::path canon = fs::weakly_canonical(p, ec);
+    return ec ? p : canon;
+}
+
+// The folder set_project_dir() named, empty for the working directory. The
+// host may change it on its UI thread while a chat thread reads it.
+std::mutex& project_mutex() {
+    static std::mutex m;
+    return m;
+}
+fs::path& project_storage() {
+    static fs::path dir;
+    return dir;
+}
+
+// The project (local) scope is stored centrally per project folder under the
 // user's home, NOT inside the project folder. This means a cloned repo can't
 // ship config/commands to the agent, and nothing is ever written into the
 // project tree (so no .gitignore entry is needed). Keyed by the canonical
-// absolute path of the current directory.
+// absolute path of the project folder.
 fs::path local_path(const std::string& filename) {
-    std::error_code ec;
-    fs::path cwd = fs::current_path(ec);
-    if (ec) cwd = ".";
-    fs::path canon = fs::weakly_canonical(cwd, ec);
-    if (ec) canon = cwd;
-    return home_dir() / ".tapto" / "projects" / project_key(canon) / filename;
+    return home_dir() / ".tapto" / "projects" / project_key(project_dir()) / filename;
 }
 
 // Resolve the path to a named store file ("config", "commands", ...) for a scope.
@@ -106,6 +119,28 @@ const char* level_name(Level level) {
         case Level::Policy: return "policy";
     }
     return "unknown";
+}
+
+void set_project_dir(const fs::path& dir) {
+    fs::path canon;
+    if (!dir.empty()) {
+        std::error_code ec;
+        canon = canonical_or_given(fs::absolute(dir, ec));
+        if (ec) canon = dir;
+    }
+    std::lock_guard<std::mutex> lock(project_mutex());
+    project_storage() = canon;
+}
+
+fs::path project_dir() {
+    {
+        std::lock_guard<std::mutex> lock(project_mutex());
+        if (!project_storage().empty()) return project_storage();
+    }
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    if (ec) cwd = ".";
+    return canonical_or_given(cwd);
 }
 
 fs::path global_dir() {

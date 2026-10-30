@@ -26,11 +26,12 @@ class TempFolder;
 //
 // The core decides everything a plugin could get wrong, once, here:
 //
-//  - Where from: plugin_directory() only (beside the exe; see below). Not PATH, not
-//    the working directory, not the project.
+//  - Where from: plugin_directory() only (beside the program's file; see
+//    below). Not PATH, not the working directory, not the project.
 //  - Whose: on Windows a Release build loads a module only when it carries a
 //    valid Authenticode signature by the certificate that signed the program
-//    itself. A Debug build loads unsigned ones and says so in the trace.
+//    itself (program_file(): the DLL, when a host process loaded one). A
+//    Debug build loads unsigned ones and says so in the trace.
 //  - What: the plugin's tools must be named "<plugin>_...", so it can neither
 //    collide with another plugin nor stand in for a core tool. A tool that
 //    declares "writes" is not offered at all unless the plugin was loaded rw.
@@ -56,8 +57,9 @@ class TempFolder;
 //    (only the plugins the policy's own plugin.<name> keys load).
 // ---------------------------------------------------------------------------
 
-// The folder plugins are loaded from: plugin_directory_for() the running
-// executable.
+// The folder plugins are loaded from: plugin_directory_for() the program's
+// file (tapto/program.h), which is the running executable unless the library
+// is linked into a DLL.
 std::filesystem::path plugin_directory();
 
 // The plugin folder of the executable at `exe`, one per executable and found

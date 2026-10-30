@@ -42,9 +42,6 @@
 #else
 #  include <dlfcn.h>
 #  include <unistd.h>
-#  ifdef __APPLE__
-#    include <mach-o/dyld.h>
-#  endif
 #endif
 
 #include <nlohmann/json.hpp>
@@ -531,19 +528,19 @@ bool signer_hash(const std::wstring& file, HANDLE handle, std::vector<uint8_t>& 
     return ok;
 }
 
-// The certificate that signed the program's own executable, the one a plugin must be
-// signed with. Empty (and `error`) when this build is not signed.
+// The certificate that signed the program's own file (program_file(): the
+// executable, or the DLL a host loaded), the one a plugin must be signed with.
+// Empty (and `error`) when this build is not signed.
 const std::vector<uint8_t>& own_signer(std::string& error) {
     static std::string own_error;
     static const std::vector<uint8_t> hash = [] {
         std::vector<uint8_t> h;
-        wchar_t path[MAX_PATH * 4];
-        const DWORD n = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-        if (n == 0 || n >= std::size(path)) {
+        const fs::path file = program_file();
+        if (file.empty()) {
             own_error = program_name() + "'s own path could not be read";
             return h;
         }
-        if (!signer_hash(path, nullptr, h, own_error)) {
+        if (!signer_hash(file.wstring(), nullptr, h, own_error)) {
             mclog("[plugins] " + program_name() + " itself: " + own_error + "\n");
             own_error = "this " + program_name() + " build is not signed, so it loads no plugin "
                         "(a Debug build loads unsigned ones)";
@@ -951,23 +948,8 @@ fs::path plugin_directory_for(const fs::path& exe) {
 }
 
 fs::path plugin_directory() {
-#ifdef _WIN32
-    wchar_t path[MAX_PATH * 4];
-    const DWORD n = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-    if (n == 0 || n >= std::size(path)) return {};
-    return plugin_directory_for(fs::path(path));
-#elif defined(__APPLE__)
-    char buf[4096];
-    uint32_t size = sizeof buf;
-    if (_NSGetExecutablePath(buf, &size) != 0) return {};
-    std::error_code ec;
-    return plugin_directory_for(fs::canonical(buf, ec));
-#else
-    std::error_code ec;
-    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    if (ec) return {};
-    return plugin_directory_for(exe);
-#endif
+    const fs::path file = program_file();
+    return file.empty() ? fs::path() : plugin_directory_for(file);
 }
 
 std::vector<std::string> available_plugins() {

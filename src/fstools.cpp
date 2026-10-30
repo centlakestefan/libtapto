@@ -12,6 +12,7 @@
 
 #include "tapto/context.h"
 #include "tapto/encoding.h"
+#include "tapto/paths.h"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -173,6 +174,14 @@ fs::path canonical_or_normal(const fs::path& p) {
     return ec ? p.lexically_normal() : c;
 }
 
+// A folder the user or program names, relative to the project folder rather
+// than the process's working directory: in a program hosted by another (an
+// IDE extension) the two differ.
+fs::path in_project(const std::string& path) {
+    const fs::path given(path);
+    return given.empty() || given.is_absolute() ? given : project_dir() / given;
+}
+
 std::string label_for(const fs::path& root, const std::vector<Folder>& taken) {
     std::string base = root.filename().string();
     if (base.empty()) base = root.root_name().string(); // "C:" for a drive root
@@ -218,11 +227,11 @@ std::string FolderSet::add_system(const std::string& label, const std::string& p
         if (f.label == label) return "ERROR: the label '" + label + "' is in use.";
     }
     std::error_code ec;
-    const fs::path given(path);
+    const fs::path given = in_project(path);
     if (!fs::is_directory(given, ec)) return "ERROR: '" + path + "' is not a directory.";
 
     Folder f;
-    f.root = canonical_or_normal(fs::absolute(given, ec));
+    f.root = canonical_or_normal(given);
     f.label = label;
     f.writable = writable;
     f.system = true;
@@ -259,11 +268,11 @@ bool FolderSet::has_grants() const {
 std::string FolderSet::set_home(const std::string& path, bool writable) {
     if (path.empty()) return "ERROR: no folder given.";
     std::error_code ec;
-    const fs::path given(path);
+    const fs::path given = in_project(path);
     if (!fs::exists(given, ec)) return "ERROR: '" + path + "' does not exist.";
     if (!fs::is_directory(given, ec)) return "ERROR: '" + path + "' is not a directory.";
 
-    const fs::path root = canonical_or_normal(fs::absolute(given, ec));
+    const fs::path root = canonical_or_normal(given);
     // A previous home goes, and so does any grant the new one covers; the
     // program's own folders stay, wherever they are.
     m_folders.erase(std::remove_if(m_folders.begin(), m_folders.end(),
@@ -291,7 +300,7 @@ const Folder* FolderSet::find(const std::string& path_or_label) const {
     for (const auto& f : m_folders) {
         if (f.label == path_or_label) return &f;
     }
-    const fs::path wanted = canonical_or_normal(fs::path(path_or_label));
+    const fs::path wanted = canonical_or_normal(in_project(path_or_label));
     for (const auto& f : m_folders) {
         if (is_within(f.root, wanted) && is_within(wanted, f.root)) return &f;
     }
@@ -317,11 +326,11 @@ const Folder* FolderSet::owner_of(const fs::path& canonical) const {
 std::string FolderSet::add(const std::string& path, std::string* label_out, bool writable) {
     if (path.empty()) return "ERROR: no folder given.";
     std::error_code ec;
-    const fs::path given(path);
+    const fs::path given = in_project(path);
     if (!fs::exists(given, ec)) return "ERROR: '" + path + "' does not exist.";
     if (!fs::is_directory(given, ec)) return "ERROR: '" + path + "' is not a directory.";
 
-    const fs::path root = canonical_or_normal(fs::absolute(given, ec));
+    const fs::path root = canonical_or_normal(given);
     // The same directory, or a subfolder of one already granted: covered
     // already, so report the folder that covers it and add nothing.
     if (const Folder* have = owner_of(root)) {

@@ -3,17 +3,24 @@
 
 #pragma once
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
 namespace tapto {
 
-// The program the library runs in ("tapto-code", "tapto-word", "tapto-vnc"),
-// for what the library says to the model and the user: "tapto-word's own
-// folders", "tapto-code never writes to a git directory". Set once at start,
-// before any tool is built; "tapto" until then.
+// The program the library runs in ("tapto-code", "tapto-word", "tapto-vnc",
+// "tapto-msvc"), for what the library says to the model and the user:
+// "tapto-word's own folders", "tapto-code never writes to a git directory".
+// Set once at start, before any tool is built; "tapto" until then.
 void set_program_name(const std::string& name);
 const std::string& program_name();
+
+// The file the program's code runs from: its executable, or on Windows the
+// DLL the library is linked into when a host process loads it (an IDE
+// extension in devenv.exe). Plugins must be signed like this file, and sit
+// beside it (tapto/plugins.h). Empty if it cannot be found.
+std::filesystem::path program_file();
 
 // The tapto programs, whose names may start a config key: the config is
 // shared, and "tapto-word.print-cot" is print-cot for tapto-word alone. A
