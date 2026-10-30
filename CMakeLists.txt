@@ -132,6 +132,7 @@ add_library(tapto STATIC
   src/fstools.cpp
   src/pathrules.cpp
   src/editor.cpp
+  src/commands.cpp
   src/program.cpp
   src/overflow.cpp
   src/plugins.cpp

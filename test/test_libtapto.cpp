@@ -33,6 +33,7 @@
 #include "tapto/aiconfig.h"
 #include "tapto/base64.h"
 #include "tapto/chat_commands.h"
+#include "tapto/commands.h"
 #include "tapto/certs.h"
 #include "tapto/claude.h"
 #include "tapto/config.h"
@@ -1378,6 +1379,85 @@ void test_editor_buffers() {
     CHECK(contains(on_disk(t.root / "proj" / "README.md"), "Hello disk."));
 }
 
+// The command tools, in a home of their own: the built-ins read in the
+// working directory, an allow-listed command runs without a shell, and what
+// is not allowed never runs.
+void test_command_tools() {
+    Tree t("command-tools");
+    const fs::path home = scratch_file("home-commands");
+    fs::remove_all(home);
+    fs::create_directories(home);
+    const char* home_var =
+#ifdef _WIN32
+        "USERPROFILE";
+#else
+        "HOME";
+#endif
+    auto env = [](const char* name, const std::string& value) {
+#ifdef _WIN32
+        _putenv_s(name, value.c_str());
+#else
+        setenv(name, value.c_str(), 1);
+#endif
+    };
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    const char* old_home_raw = std::getenv(home_var);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    const std::string old_home = old_home_raw ? old_home_raw : "";
+    env(home_var, home.string());
+
+    tapto::FolderSet set;
+    CHECK_EQ(set.set_home((t.root / "proj").string(), /*writable=*/true), std::string());
+    const auto tools = tapto::command_tools(set);
+    CHECK_EQ(tools.size(), std::size_t(2));
+    auto cmd = [&](json in) { return run(tools, "run_command", std::move(in)); };
+
+    // The built-ins, in the working directory or a cwd in it.
+    std::string r = cmd({{"name", "ls"}});
+    CHECK(contains(r, "README.md") && contains(r, "src/"));
+    CHECK(contains(cmd({{"name", "cat"}, {"args", {"src/main.cpp"}}}), "int main()"));
+    CHECK(starts_with(cmd({{"name", "wc"}, {"args", {"-l", "src/main.cpp"}}}), "3 "));
+    CHECK(contains(cmd({{"name", "ls"}, {"cwd", "src"}}), "main.cpp"));
+    r = cmd({{"name", "cat"}, {"args", {"../other/secret.txt"}}});
+    CHECK(starts_with(r, "ERROR:") && !contains(r, "not for the model"));
+    CHECK(tapto::is_builtin_command("tree") && !tapto::is_builtin_command("make"));
+
+    r = cmd({{"name", "nope"}});
+    CHECK(starts_with(r, "ERROR:") && contains(r, "Unknown command"));
+
+    if (tapto::policy_allows_user_commands()) {
+#ifdef _WIN32
+        const char* host = "[ro] hostname # prints the machine's name";
+#else
+        const char* host = "[ro] uname # prints the system's name";
+#endif
+        tapto::add_command(tapto::Level::Global, "host", host);
+        tapto::add_command(tapto::Level::Global, "piped", "hostname | more");
+        tapto::add_command(tapto::Level::Global, "grep-in", "grep x %p1");
+
+        r = run(tools, "list_commands", json::object());
+        CHECK(contains(r, "- host: [ro]") && contains(r, "# prints the"));
+        r = cmd({{"name", "host"}});
+        CHECK(contains(r, "[exit code: 0]"));
+        // Values for a command without placeholders are refused, not dropped.
+        CHECK(starts_with(cmd({{"name", "host"}, {"args", {"extra"}}}), "ERROR:"));
+        // Shell syntax never reaches a program.
+        r = cmd({{"name", "piped"}});
+        CHECK(starts_with(r, "ERROR:") && contains(r, "shell syntax"));
+        // A %p path outside the folders is refused before anything runs.
+        r = cmd({{"name", "grep-in"}, {"args", {"../other/secret.txt"}}});
+        CHECK(starts_with(r, "ERROR:") && !contains(r, "exit code"));
+    }
+
+    env(home_var, old_home);
+    fs::remove_all(home);
+}
+
 // Settings per program and the shared commands, in a home of their own: a
 // program key overrides the shared one at its scope and comes out under the
 // shared name, another program's is left out, a more specific scope's shared
@@ -1554,6 +1634,7 @@ int main() {
     test_folder_tools();
     test_editor_without_home();
     test_editor_buffers();
+    test_command_tools();
     test_program_keys_and_commands();
     test_certificates();
     test_user_agent_sent();
