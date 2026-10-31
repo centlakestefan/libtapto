@@ -626,30 +626,52 @@ private:
 
 #else // POSIX
 
+// A pipe whose ends the programs this one starts do not inherit; only what
+// dup2 puts at 0, 1 and 2 reaches a child (dup2 clears the flag). pipe2 sets
+// it as the pipe is made; elsewhere there is a moment without it, which
+// spawn_mutex covers for the servers started here.
+bool make_pipe(int fds[2]) {
+#ifdef __linux__
+    return pipe2(fds, O_CLOEXEC) == 0;
+#else
+    if (pipe(fds) != 0) return false;
+    for (int i = 0; i < 2; ++i) fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+    return true;
+#endif
+}
+
+// Held from making a server's pipes until it is spawned. The servers start
+// in parallel threads, and a pipe end that leaks into a sibling keeps that
+// pipe open after its own server has gone: stop() then waits for an end of
+// file that does not come while the sibling runs.
+std::mutex& spawn_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 class Process {
 public:
     ~Process() { stop(); }
 
     bool start(const std::string& command, const std::vector<std::string>& args,
                const std::map<std::string, std::string>& env, std::string& error) {
+        std::lock_guard<std::mutex> spawning(spawn_mutex());
         int in[2], out[2], err[2];
-        if (pipe(in) != 0) {
+        if (!make_pipe(in)) {
             error = "cannot make pipes";
             return false;
         }
-        if (pipe(out) != 0) {
+        if (!make_pipe(out)) {
             ::close(in[0]);
             ::close(in[1]);
             error = "cannot make pipes";
             return false;
         }
-        if (pipe(err) != 0) {
+        if (!make_pipe(err)) {
             for (int fd : {in[0], in[1], out[0], out[1]}) ::close(fd);
             error = "cannot make pipes";
             return false;
         }
-        // Only what dup2 puts at 0, 1 and 2 reaches the child (dup2 clears the flag).
-        for (int fd : {in[0], in[1], out[0], out[1], err[0], err[1]}) fcntl(fd, F_SETFD, FD_CLOEXEC);
 
         std::map<std::string, std::string> vars;
         for (char** e = environ; e && *e; ++e) {
@@ -1383,6 +1405,7 @@ struct OAuthState {
     }
 };
 
+#ifndef NDEBUG
 std::string env_value(const char* name) {
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -1394,6 +1417,7 @@ std::string env_value(const char* name) {
 #endif
     return v ? v : "";
 }
+#endif
 
 // Opens `url` in the user's browser; "" on success, else what went wrong. The
 // URL is one opaque argument: no shell parses it.
