@@ -18,6 +18,7 @@
 #include "tapto/log.h"
 #include "tapto/tool_image.h"
 #include "tapto/ui.h"
+#include "tapto/usage.h"
 
 using json = nlohmann::json;
 namespace ui = tapto::ui;
@@ -283,6 +284,7 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                       " completion=" + std::to_string(usage.value("completion_tokens", 0)) +
                       " total=" + std::to_string(usage.value("total_tokens", 0)) + "\n");
             }
+            tapto::report_usage(m_config->usageCallback(), "openai", m_model, resp);
             return resp;
         }
 

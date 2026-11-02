@@ -6,6 +6,8 @@
 #include <string>
 #include <utility>
 
+#include "tapto/usage.h"
+
 // Lightweight settings object for the AI backends.
 class AiConfig {
 public:
@@ -21,6 +23,7 @@ public:
     int keepRecentImages() const { return m_keepRecentImages; }
     bool printCot() const { return m_printCot; }
     const std::string& userAgent() const { return m_userAgent; }
+    const tapto::UsageCallback& usageCallback() const { return m_usageCallback; }
 
     void setMaxOutputTokens(int v) { m_maxOutputTokens = v; }
     void setMaxToolIterations(int v) { m_maxToolIterations = v; }
@@ -33,6 +36,7 @@ public:
     void setKeepRecentImages(int v) { m_keepRecentImages = v; }
     void setPrintCot(bool v) { m_printCot = v; }
     void setUserAgent(std::string v) { m_userAgent = std::move(v); }
+    void setUsageCallback(tapto::UsageCallback v) { m_usageCallback = std::move(v); }
 
 private:
     int m_maxOutputTokens = 16000;
@@ -80,4 +84,9 @@ private:
     // no header of ours and leaves the HTTP library's default. The program
     // names itself, not the library.
     std::string m_userAgent;
+
+    // Told the tokens of each request that succeeded (tapto/usage.h), for a
+    // program that accounts for them: a server charging them to a tenant.
+    // Empty: nobody is told.
+    tapto::UsageCallback m_usageCallback;
 };

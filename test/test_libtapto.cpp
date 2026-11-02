@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -51,6 +52,7 @@
 #include "tapto/secret.h"
 #include "tapto/tool_image.h"
 #include "tapto/tool_registry.h"
+#include "tapto/usage.h"
 
 using nlohmann::json;
 namespace fs = std::filesystem;
@@ -1161,6 +1163,61 @@ void test_certificates() {
     fs::remove_all(dir);
 }
 
+// --- token usage --------------------------------------------------------------
+
+// The three dialects' usage, the same way: cached input apart from the rest,
+// reasoning in the output.
+void test_usage_from() {
+    tapto::TokenUsage u;
+    CHECK(tapto::usage_from("claude",
+                            json{{"usage", {{"input_tokens", 10}, {"output_tokens", 5},
+                                            {"cache_read_input_tokens", 100}, {"cache_creation_input_tokens", 20}}}},
+                            u));
+    CHECK_EQ(u.input, std::uint64_t(10));
+    CHECK_EQ(u.output, std::uint64_t(5));
+    CHECK_EQ(u.cache_read, std::uint64_t(100));
+    CHECK_EQ(u.cache_write, std::uint64_t(20));
+
+    u = {};
+    CHECK(tapto::usage_from("openai",
+                            json{{"usage", {{"prompt_tokens", 110}, {"completion_tokens", 7},
+                                            {"prompt_tokens_details", {{"cached_tokens", 100}}}}}},
+                            u));
+    CHECK_EQ(u.input, std::uint64_t(10));
+    CHECK_EQ(u.cache_read, std::uint64_t(100));
+    CHECK_EQ(u.output, std::uint64_t(7));
+    u = {};
+    CHECK(tapto::usage_from("openai",
+                            json{{"usage", {{"input_tokens", 30}, {"output_tokens", 4},
+                                            {"input_tokens_details", {{"cached_tokens", 25}}}}}},
+                            u));
+    CHECK_EQ(u.input, std::uint64_t(5));
+    CHECK_EQ(u.cache_read, std::uint64_t(25));
+    CHECK_EQ(u.output, std::uint64_t(4));
+
+    u = {};
+    CHECK(tapto::usage_from("gemini",
+                            json{{"usageMetadata", {{"promptTokenCount", 50}, {"cachedContentTokenCount", 40},
+                                                    {"candidatesTokenCount", 3}, {"thoughtsTokenCount", 9}}}},
+                            u));
+    CHECK_EQ(u.input, std::uint64_t(10));
+    CHECK_EQ(u.cache_read, std::uint64_t(40));
+    CHECK_EQ(u.output, std::uint64_t(12));
+
+    // none reported, or nonsense: nothing to tell
+    CHECK(!tapto::usage_from("claude", json{{"content", json::array()}}, u));
+    CHECK(!tapto::usage_from("openai", json{{"usage", json::object()}}, u));
+    CHECK(!tapto::usage_from("gemini", json::array(), u));
+    u = {};
+    CHECK(tapto::usage_from("claude", json{{"usage", {{"input_tokens", -3}, {"output_tokens", "x"}}}}, u));
+    CHECK_EQ(u.input, std::uint64_t(0));
+    CHECK_EQ(u.output, std::uint64_t(0));
+
+    // a callback that throws does not fail the request
+    tapto::report_usage([](const tapto::TokenUsage&) { throw std::runtime_error("no"); }, "claude", "m",
+                        json{{"usage", {{"input_tokens", 1}}}});
+}
+
 // --- User-Agent -------------------------------------------------------------
 
 // One real request per dialect against a local server that answers each with
@@ -1217,10 +1274,20 @@ void test_user_agent_sent() {
 
     AiConfig named;
     named.setUserAgent("tapto-test/9.9.9 (abc1234; testos)");
+    std::vector<tapto::TokenUsage> told;
+    named.setUsageCallback([&told](const tapto::TokenUsage& u) { told.push_back(u); });
     for (const char* dialect : {"claude", "openai", "gemini"}) {
+        told.clear();
         ask(named, dialect);
         CHECK(had_header);
         CHECK_EQ(seen, std::string("tapto-test/9.9.9 (abc1234; testos)"));
+        // each request's usage, to the program that asked for it
+        CHECK_EQ(told.size(), std::size_t(1));
+        if (told.size() == 1) {
+            CHECK_EQ(told[0].model, std::string("m"));
+            CHECK_EQ(told[0].input, std::uint64_t(1));
+            CHECK_EQ(told[0].output, std::uint64_t(std::string(dialect) == "gemini" ? 0 : 1));
+        }
     }
 
     // Unset: none of ours. Whatever the HTTP library sends by default is its
@@ -1637,6 +1704,7 @@ int main() {
     test_command_tools();
     test_program_keys_and_commands();
     test_certificates();
+    test_usage_from();
     test_user_agent_sent();
 
     if (g_failures) {

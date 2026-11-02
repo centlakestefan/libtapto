@@ -16,6 +16,7 @@
 #include "tapto/log.h"
 #include "tapto/tool_image.h"
 #include "tapto/ui.h"
+#include "tapto/usage.h"
 
 using json = nlohmann::json;
 namespace ui = tapto::ui;
@@ -182,6 +183,7 @@ nlohmann::json GeminiClient::call_gemini(
         if (res->status == 200) {
             json resp = json::parse(res->body);
             m_lastInputTokens = resp.value("usageMetadata", json::object()).value("promptTokenCount", 0);
+            tapto::report_usage(m_config->usageCallback(), "gemini", m_model, resp);
             return resp;
         }
 

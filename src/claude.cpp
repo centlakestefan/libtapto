@@ -16,6 +16,7 @@
 #include "tapto/log.h"
 #include "tapto/tool_image.h"
 #include "tapto/ui.h"
+#include "tapto/usage.h"
 
 using json = nlohmann::json;
 namespace ui = tapto::ui;
@@ -228,6 +229,7 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
             } else {
                 m_lastInputTokens = 0;
             }
+            tapto::report_usage(m_config->usageCallback(), "claude", m_model, resp);
             return resp;
         }
 
