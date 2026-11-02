@@ -651,6 +651,16 @@ struct Plugins::Loaded {
     // plugin was added.
     FolderSet* folders = nullptr;
     TempFolder* temp = nullptr;
+    // The program's own settings for it (Plugins::set_setting), before the config's.
+    std::map<std::string, std::string> settings;
+
+    std::optional<std::string> setting(const std::string& key) const {
+        if (auto it = settings.find(key); it != settings.end()) {
+            if (it->second.empty()) return std::nullopt;
+            return it->second;
+        }
+        return get_effective(key);
+    }
 
     Module module;
     CanUnloadNowFn can_unload = nullptr;
@@ -853,7 +863,7 @@ std::string read_tools(const json& list, Plugins::Loaded& l) {
 std::string plugin_config(const Plugins::Loaded& l, std::string& error) {
     json c = json::object();
     for (const auto& key : l.config_keys) {
-        auto v = get_effective(key);
+        auto v = l.setting(key);
         if (!v) continue;
         if (l.secret_keys.count(key)) {
             const Secret s = resolve_secret(*v);
@@ -1017,7 +1027,7 @@ std::string add_folder(Plugins::Loaded& p, FolderSet* folders) {
     if (!folders) return "it wants a folder, and this " + program_name() + " has none to give";
     std::error_code ec;
     fs::path dir;
-    if (auto set = p.folder_key.empty() ? std::nullopt : get_effective(p.folder_key)) {
+    if (auto set = p.folder_key.empty() ? std::nullopt : p.setting(p.folder_key)) {
         // A setting, perhaps the policy's: the user's or the admin's own
         // folder, which is never made here.
         dir = fs::u8path(*set);
@@ -1189,6 +1199,7 @@ std::string Plugins::add(const std::string& name, bool writable, bool by_policy)
     l->writable = writable;
     l->folders = m_folders;
     l->temp = m_temp;
+    l->settings = m_settings;
     std::string error;
     if (!load_module(file, l->module, error)) return error;
     if (std::string why = attach(*l, /*check_name=*/true, /*configure=*/true, m_folders);
@@ -1208,6 +1219,7 @@ std::string Plugins::add_file(const fs::path& file, bool writable) {
     l->writable = writable;
     l->folders = m_folders;
     l->temp = m_temp;
+    l->settings = m_settings;
     std::string error;
     if (!load_module(file, l->module, error)) return error;
     if (std::string why = attach(*l, /*check_name=*/false, /*configure=*/true, m_folders);

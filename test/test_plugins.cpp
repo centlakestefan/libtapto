@@ -691,6 +691,33 @@ int main(int argc, char** argv) {
         CHECK_TRUE(contains(plugins.prompt(), "- deploy: Ship it. (@skills/deploy/SKILL.md)"));
         CHECK_TRUE(!contains(plugins.prompt(), "release-notes"));
         CHECK_TRUE(plugins.remove("skills"));
+
+        // The program's own setting beats the config's: a server gives each
+        // agent's plugins a folder of its own, two sets side by side.
+        const fs::path mine = fake_home / "agent-skills";
+        write(mine / "triage.md", "---\ndescription: Sort the bug reports.\n---\n");
+        {
+            tapto::FolderSet folders2;
+            CHECK_EQ(folders2.set_home(cwd.string(), false), "");
+            tapto::Plugins second(&folders2);
+            second.set_setting("skills-folder", mine.u8string());
+            CHECK_EQ(second.add_file(skills_module, false), "");
+            CHECK_TRUE(folders2.get("@skills") && fs::equivalent(folders2.get("@skills")->root, mine));
+            CHECK_TRUE(contains(second.prompt(), "- triage: Sort the bug reports. (@skills/triage.md)"));
+            CHECK_TRUE(!contains(second.prompt(), "deploy"));
+            // the config's set is untouched by it
+            CHECK_EQ(plugins.add_file(skills_module, false), "");
+            CHECK_TRUE(contains(plugins.prompt(), "- deploy: Ship it."));
+            CHECK_TRUE(!contains(plugins.prompt(), "triage"));
+            CHECK_TRUE(plugins.remove("skills"));
+            // an empty one unsets the config's: the folder per user
+            tapto::FolderSet folders3;
+            CHECK_EQ(folders3.set_home(cwd.string(), false), "");
+            tapto::Plugins third(&folders3);
+            third.set_setting("skills-folder", "");
+            CHECK_EQ(third.add_file(skills_module, false), "");
+            CHECK_TRUE(folders3.get("@skills") && fs::equivalent(folders3.get("@skills")->root, dir));
+        }
         set_folder_key("");
     }
 

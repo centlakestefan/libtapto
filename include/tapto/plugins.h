@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -147,6 +148,15 @@ public:
     // added without folders takes no path argument.
     void set_temp_folder(TempFolder* temp) { m_temp = temp; }
 
+    // A plugin setting this object gives its plugins, in place of the
+    // config's: a "<plugin>-..." key, which the plugin must declare. For a
+    // program with many sessions in one process (a server: one per agent)
+    // whose settings are its own, not the files of the user it runs as. A
+    // folder key set here names the plugin's folder, as from the config. An
+    // empty value unsets the key for these plugins. Taken when a plugin is
+    // added: set them first.
+    void set_setting(const std::string& key, const std::string& value) { m_settings[key] = value; }
+
     // Loads plugin `name` from plugin_directory(), or changes its mode when it
     // is loaded already. Policy is applied. "" on success, else what went wrong.
     std::string add(const std::string& name, bool writable, bool by_policy = false);
@@ -214,6 +224,7 @@ private:
     std::vector<std::unique_ptr<Loaded>> m_hidden; // removed, module kept until exit
     FolderSet* m_folders = nullptr;
     TempFolder* m_temp = nullptr;
+    std::map<std::string, std::string> m_settings;
 };
 
 } // namespace tapto
