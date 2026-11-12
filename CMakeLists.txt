@@ -251,18 +251,20 @@ if(LIBTAPTO_BUILD_PLUGINS)
   # there; the library does not link it.
   #
   # The stb repository has no tags (it releases by branch), so the version is
-  # taken from `master`, the stable release line. It is pinned to a branch
-  # rather than a commit for now; if stb's master advances in a way that
-  # breaks the build, pin a specific commit here instead. The repo has no
-  # CMakeLists.txt, so it is populated rather than made available -- the
-  # CMP0169 policy (CMake 3.31+) keeps the direct Populate call from warning
-  # about itself.
+  # a commit of `master`, the stable release line: the branch itself moved
+  # under every build, and its release of 2026-11-11 broke the plugin (a
+  # req_comp of 0, the image's own channel count, refused as invalid;
+  # nothings/stb#2055). Pinned to the last master commit before it; move the
+  # pin to a later master commit once it has the fix, and run test-plugins.
+  # The repo has no CMakeLists.txt, so it is populated rather than made
+  # available -- the CMP0169 policy (CMake 3.31+) keeps the direct Populate
+  # call from warning about itself.
   if(POLICY CMP0169)
     cmake_policy(SET CMP0169 OLD)
   endif()
   FetchContent_Declare(stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG        master
+    GIT_TAG        4e9b368bfc071e97206ea5c6adba68dd0cbf8897
   )
   FetchContent_GetProperties(stb)
   if(NOT stb_POPULATED)
