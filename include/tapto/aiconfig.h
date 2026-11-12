@@ -24,6 +24,7 @@ public:
     bool printCot() const { return m_printCot; }
     const std::string& userAgent() const { return m_userAgent; }
     const tapto::UsageCallback& usageCallback() const { return m_usageCallback; }
+    const tapto::RetryCallback& retryCallback() const { return m_retryCallback; }
 
     void setMaxOutputTokens(int v) { m_maxOutputTokens = v; }
     void setMaxToolIterations(int v) { m_maxToolIterations = v; }
@@ -37,6 +38,7 @@ public:
     void setPrintCot(bool v) { m_printCot = v; }
     void setUserAgent(std::string v) { m_userAgent = std::move(v); }
     void setUsageCallback(tapto::UsageCallback v) { m_usageCallback = std::move(v); }
+    void setRetryCallback(tapto::RetryCallback v) { m_retryCallback = std::move(v); }
 
 private:
     int m_maxOutputTokens = 16000;
@@ -89,4 +91,5 @@ private:
     // program that accounts for them: a server charging them to a tenant.
     // Empty: nobody is told.
     tapto::UsageCallback m_usageCallback;
+    tapto::RetryCallback m_retryCallback;
 };

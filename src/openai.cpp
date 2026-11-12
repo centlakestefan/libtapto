@@ -248,6 +248,7 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
             retry_msg << "Retrying in " << wait_seconds << " seconds...\n";
             mclog(retry_msg.str());
 
+            tapto::report_retry(m_config->retryCallback(), "connection failed: " + error_msg, connection_retry_count, MAX_CONNECTION_RETRIES, wait_seconds);
             std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
             continue;
         }
@@ -326,6 +327,7 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                    << "). Waiting " << wait_seconds << " seconds before retry\n";
             mclog(log_msg.str());
 
+            tapto::report_retry(m_config->retryCallback(), "rate limited (429)", rate_limit_retries, MAX_RATE_LIMIT_RETRIES, wait_seconds);
             std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
             continue;
         }
@@ -448,6 +450,7 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                    << ". Retrying in " << wait_seconds << " seconds\n";
             mclog(log_msg.str());
 
+            tapto::report_retry(m_config->retryCallback(), error_msg + " (" + std::to_string(status) + ")", server_error_retries, MAX_SERVER_ERROR_RETRIES, wait_seconds);
             std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
             continue;
         }

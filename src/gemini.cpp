@@ -174,6 +174,7 @@ nlohmann::json GeminiClient::call_gemini(
             connection_retry_count++;
             init_api_client();
             int wait_seconds = std::min(2 * (1 << std::min(connection_retry_count - 1, 16)), 32);
+            tapto::report_retry(m_config->retryCallback(), "connection failed: " + error_msg, connection_retry_count, max_connection_retries, wait_seconds);
             std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
             continue;
         }
@@ -225,6 +226,7 @@ nlohmann::json GeminiClient::call_gemini(
                    << "). Waiting " << wait_seconds << " seconds before retry\n";
             mclog(log_msg.str());
 
+            tapto::report_retry(m_config->retryCallback(), "rate limited (429)", rate_limit_retries, max_rate_limit_retries, wait_seconds);
             std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
             continue;
         }
@@ -263,6 +265,7 @@ nlohmann::json GeminiClient::call_gemini(
                    << ". Retrying in " << wait_seconds << " seconds\n";
             mclog(log_msg.str());
 
+            tapto::report_retry(m_config->retryCallback(), error_msg + " (" + std::to_string(res->status) + ")", server_error_retries, max_server_error_retries, wait_seconds);
             std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
             continue;
         }

@@ -30,6 +30,20 @@ struct TokenUsage {
 // thread that made it (AiConfig::setUsageCallback).
 using UsageCallback = std::function<void(const TokenUsage&)>;
 
+// A request that failed and is about to be sent again: why (the connection's
+// error, or the HTTP status), which retry this is of how many, and the wait
+// before it.
+struct RetryInfo {
+    std::string reason;
+    int retry = 0;
+    int max_retries = 0;
+    int wait_seconds = 0;
+};
+
+// Called before each retry, on the thread that made the request
+// (AiConfig::setRetryCallback).
+using RetryCallback = std::function<void(const RetryInfo&)>;
+
 namespace usage_detail {
 inline std::uint64_t num(const nlohmann::json& o, const char* key) {
     if (!o.is_object()) return 0;
@@ -98,6 +112,22 @@ inline void report_usage(const UsageCallback& cb, const std::string& dialect, co
     u.model = model;
     try {
         cb(u);
+    } catch (...) {
+    }
+}
+
+// For the clients: tells the callback, if there is one, of a retry. A
+// callback that throws does not fail the request.
+inline void report_retry(const RetryCallback& cb, std::string reason, int retry, int max_retries,
+                         int wait_seconds) {
+    if (!cb) return;
+    RetryInfo r;
+    r.reason = std::move(reason);
+    r.retry = retry;
+    r.max_retries = max_retries;
+    r.wait_seconds = wait_seconds;
+    try {
+        cb(r);
     } catch (...) {
     }
 }
