@@ -513,11 +513,16 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
         std::error_code ec;
         if (!fs::exists(base, ec)) return "ERROR: Path not found: " + start;
 
-        constexpr size_t kMaxFiles = 100;
-        constexpr size_t kMaxLinesPerFile = 20;
+        // Every match, not a sample: a result too long for the conversation
+        // goes to @tmp whole (the overflow in editor_tools), where the model
+        // reads or searches it. Only a search that would fill the disk stops,
+        // and says so.
+        constexpr size_t kMaxFiles = 100000;
+        constexpr size_t kMaxLines = 100000;
         // A matching line is shown up to this many bytes: a minified or
         // one-line file must not put megabytes into one result.
         constexpr size_t kMaxLineBytes = 300;
+        size_t total_lines = 0;
 
         struct Match {
             std::string path;
@@ -525,7 +530,7 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
         };
         std::vector<Match> results;
 
-        bool more = false; // stopped at kMaxFiles with files left to look at
+        bool more = false; // stopped at kMaxFiles or kMaxLines with more left
         fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec), end;
         for (; it != end; it.increment(ec)) {
             if (ec) break;
@@ -540,7 +545,7 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
             }
             if (!it->is_regular_file(ec)) continue;
             if (!wildcard_match(pattern, p.filename().string())) continue;
-            if (results.size() >= kMaxFiles) {
+            if (results.size() >= kMaxFiles || total_lines >= kMaxLines) {
                 // a further match: only to say there are more (for a content
                 // search, a name match whose content may not match; close enough)
                 more = true;
@@ -561,9 +566,15 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
                 // loading it whole: a content search must reach files far larger
                 // than the context window (the old 5 MiB cap made find_files
                 // report "no files" on any big log). The probe inside bails out
-                // on binaries, and we keep at most kMaxLinesPerFile hits per file.
-                auto lines = find_matching_lines(p, query, kMaxLinesPerFile);
+                // on binaries. One more than is left tells whether the stop
+                // left matches out.
+                auto lines = find_matching_lines(p, query, kMaxLines - total_lines + 1);
                 if (lines.empty()) continue;   // file name matched, content didn't
+                if (lines.size() > kMaxLines - total_lines) {
+                    lines.resize(kMaxLines - total_lines);
+                    more = true;
+                }
+                total_lines += lines.size();
                 for (const auto& lm : lines) {
                     std::string text = lm.text;
                     if (text.size() > kMaxLineBytes) {
@@ -577,6 +588,7 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
             }
 
             results.push_back(std::move(m));
+            if (more) break;
         }
 
         if (results.empty()) {
@@ -595,8 +607,12 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
             }
             if (!m.lines.empty()) out << "\n";
         }
-        if (more)
-            out << "[Stopped at " << kMaxFiles << " files; there are more. Narrow the pattern or the path.]\n";
+        if (more) {
+            if (results.size() >= kMaxFiles)
+                out << "[Stopped at " << kMaxFiles << " files; there are more. Narrow the pattern or the path.]\n";
+            else
+                out << "[Stopped at " << kMaxLines << " matching lines; there are more. Narrow the search.]\n";
+        }
         return out.str();
     } catch (const std::exception& e) {
         return std::string("ERROR: find_files failed: ") + e.what();
@@ -747,7 +763,9 @@ std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buf
     find.name = "find_files";
     find.description =
         "Find files under a directory by filename pattern, optionally grepping their contents. "
-        "Supports wildcards: * (any sequence) and ? (single character).";
+        "Supports wildcards: * (any sequence) and ? (single character). "
+        "Returns every match (each line up to 300 bytes); a result too long to show "
+        "is saved whole to a file, whose start and end are shown with its path.";
     find.parameters = {
         {"type", "object"},
         {"properties", {

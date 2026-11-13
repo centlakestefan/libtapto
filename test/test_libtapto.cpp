@@ -1392,14 +1392,34 @@ void test_find_files_bounds() {
     CHECK(contains(r, "(10006 bytes)"));
     CHECK(r.size() < 1000);
 
-    // more than 100 files: the stop is said
+    // more than 100 files: all of them
     fs::create_directories(t.root / "proj" / "many");
     for (int i = 0; i < 120; ++i) Tree::write(t.root / "proj" / "many" / ("f" + std::to_string(i) + ".txt"), "a\n");
     r = run(tools, "find_files", json{{"filename", "*.txt"}, {"path", "many"}});
-    CHECK(contains(r, "Found 100 file(s)"));
-    CHECK(contains(r, "Stopped at 100 files"));
-    r = run(tools, "find_files", json{{"filename", "f1?.txt"}, {"path", "many"}});
+    CHECK(contains(r, "Found 120 file(s)"));
     CHECK(!contains(r, "Stopped at"));
+
+    // more than 20 matches in one file (the vouchers of an SIE file): all of
+    // them, in @tmp when too long to show
+    {
+        std::string sie;
+        for (int i = 1; i <= 2000; ++i) sie += "#VER A " + std::to_string(i) + " 20260101 \"Voucher\"\n{\n}\n";
+        Tree::write(t.root / "proj" / "books.se", sie);
+        r = run(tools, "find_files", json{{"filename", "books.se"}, {"search_string", "#VER"}});
+        CHECK(contains(r, "@tmp/find_files"));
+        CHECK(!contains(r, "Stopped at"));
+        std::string saved;
+        for (const auto& e : fs::directory_iterator(t.root / "tmp")) {
+            std::ifstream in(e.path(), std::ios::binary);
+            saved.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        CHECK(contains(saved, "#VER A 1 "));
+        CHECK(contains(saved, "#VER A 1000 "));
+        CHECK(contains(saved, "#VER A 2000 "));
+        fs::remove_all(t.root / "tmp");
+        fs::create_directories(t.root / "tmp");
+        fs::remove(t.root / "proj" / "books.se");
+    }
 
     // too long for the context: the whole of it in @tmp
     fs::create_directories(t.root / "proj" / "big");
