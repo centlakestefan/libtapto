@@ -14,6 +14,8 @@
 #include "tapto/base64.h"
 #include "tapto/encoding.h"
 #include "tapto/log.h"
+#include "tapto/stream.h"
+#include "stream_post.h"
 #include "tapto/tool_image.h"
 #include "tapto/ui.h"
 #include "tapto/usage.h"
@@ -66,11 +68,18 @@ std::string GeminiClient::getApiKey() {
 nlohmann::json GeminiClient::call_gemini(
     const std::string& user_message,
     const nlohmann::json& tool_schemas,
-    const nlohmann::json& conversation_history
+    const nlohmann::json& conversation_history,
+    const CancellationToken* cancel
 ) {
     std::ostringstream path_stream;
     path_stream << "/v1beta/models/" << m_model << ":generateContent";
     const std::string path = path_stream.str();
+
+    // Asked as a stream (streamGenerateContent, as server-sent events), each
+    // event holds the next parts, which post_stream puts back together into
+    // the same GenerateContentResponse.
+    const bool streaming = m_config->stream();
+    const std::string stream_path = "/v1beta/models/" + m_model + ":streamGenerateContent?alt=sse";
 
     // Build Gemini 'contents' array (history + new user message)
     json contents = conversation_history;
@@ -159,11 +168,28 @@ nlohmann::json GeminiClient::call_gemini(
 
     for (;;) {
         // Use persistent SSL client for connection reuse
-        auto res = m_api_client->Post(path, headers, body_str, "application/json");
+        tapto::StreamOutcome streamed;
+        tapto::GeminiStreamAccumulator acc;
+        auto res = streaming ? tapto::post_stream(*m_api_client, stream_path, headers, body_str,
+                                                  *m_config, cancel, acc, streamed)
+                             : m_api_client->Post(path, headers, body_str, "application/json");
+
+        // Stopped by the user partway through: what arrived is the reply.
+        if (streamed.cancelled) {
+            mclog("Reply stopped by the user partway through\n");
+            return streamed.response;
+        }
 
         // Connection error (no response): reinitialize and retry with backoff.
         if (!res) {
             std::string error_msg = httplib::to_string(res.error());
+
+            // Part of the reply is already on the user's screen. Asking again
+            // would show it a second time, and as a different reply.
+            if (streamed.shown) {
+                mclog("Connection lost partway through a streamed reply: " + error_msg + "\n");
+                throw std::runtime_error("The connection was lost partway through the reply: " + error_msg);
+            }
             mclog("Connection failed (attempt " + std::to_string(connection_retry_count + 1) +
                                   "/" + std::to_string(max_connection_retries) + "): " + error_msg + "\n");
 
@@ -182,7 +208,26 @@ nlohmann::json GeminiClient::call_gemini(
         connection_retry_count = 0;
 
         if (res->status == 200) {
-            json resp = json::parse(res->body);
+            json resp;
+            if (streamed.handled) {
+                resp = streamed.response;
+            } else {
+                resp = json::parse(res->body);
+                // Asked for a stream, answered whole: shown whole.
+                if (streaming) {
+                    std::string thought, text;
+                    const json parts = resp.value("candidates", json::array()).is_array() &&
+                                               !resp["candidates"].empty()
+                                           ? resp["candidates"][0].value("content", json::object())
+                                                 .value("parts", json::array())
+                                           : json::array();
+                    for (const auto& part : parts) {
+                        if (!part.contains("text") || !part["text"].is_string()) continue;
+                        (part.value("thought", false) ? thought : text) += part["text"].get<std::string>();
+                    }
+                    tapto::show_whole(m_config->streamCallback(), thought, text);
+                }
+            }
             m_lastInputTokens = resp.value("usageMetadata", json::object()).value("promptTokenCount", 0);
             tapto::report_usage(m_config->usageCallback(), "gemini", m_model, resp);
             return resp;
@@ -325,7 +370,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
     }
 
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = call_gemini("", tool_schemas, m_conversation_history);
+    json response = call_gemini("", tool_schemas, m_conversation_history, context.cancel);
     mclog("Gemini API response body: " + response.dump(2) + "\n");
 
     json candidate = response["candidates"][0];
@@ -372,7 +417,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
                 has_text = true;
                 mclog("assistant says: " + text + "\n");
             }
-            if (!tool_calls.empty()) {
+            if (!tool_calls.empty() && !m_config->showsStream()) {
                 ui::emit_intermediate(text, /*is_reasoning=*/is_thought, m_config->printCot());
             }
         }
@@ -476,7 +521,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = call_gemini("", tool_schemas, m_conversation_history);
+        response = call_gemini("", tool_schemas, m_conversation_history, context.cancel);
         mclog("Gemini API response body: " + response.dump(2) + "\n");
 
         candidate = response["candidates"][0];

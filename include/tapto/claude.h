@@ -72,7 +72,9 @@ public:
     void setApiKeyRef(const std::string& apiKeyRef) override;
     void setThinkingBudget(std::optional<int> budget) override { m_thinkingBudget = budget; }
 
-    nlohmann::json call_claude(const std::string& user_message, const nlohmann::json& tools, const nlohmann::json& conversation_history = nlohmann::json::array());
+    nlohmann::json call_claude(const std::string& user_message, const nlohmann::json& tools,
+                               const nlohmann::json& conversation_history = nlohmann::json::array(),
+                               const CancellationToken* cancel = nullptr);
 
     std::string chat(Context& context, const std::string& user_message) override;
 

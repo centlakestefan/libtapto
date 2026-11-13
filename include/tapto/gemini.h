@@ -67,7 +67,8 @@ public:
     nlohmann::json call_gemini(
         const std::string& user_message,
         const nlohmann::json& tool_schemas,
-        const nlohmann::json& conversation_history
+        const nlohmann::json& conversation_history,
+        const CancellationToken* cancel = nullptr
     );
 
     // Main chat loop (runs any tools the model calls, returns its text reply)

@@ -17,6 +17,7 @@
 #include "tapto/encoding.h"
 #include "tapto/log.h"
 #include "tapto/stream.h"
+#include "stream_post.h"
 #include "tapto/tool_image.h"
 #include "tapto/ui.h"
 #include "tapto/usage.h"
@@ -108,20 +109,6 @@ json historyMessage(json message) {
     return message;
 }
 
-/// <summary>Tells the stream callback a whole reply at once: for a server
-/// that was asked for a stream and answered with the complete reply instead,
-/// so a program showing replies as they stream still shows this one.</summary>
-void showWhole(const tapto::StreamCallback& cb, const json& resp) {
-    if (!resp.contains("choices") || !resp["choices"].is_array() || resp["choices"].empty()) return;
-    const json message = resp["choices"][0].value("message", json::object());
-    const std::string cot = extractReasoning(message);
-    const std::string text = extractContent(message);
-    if (cot.empty() && text.empty()) return;
-    if (!cot.empty()) cb({tapto::StreamEvent::Kind::Reasoning, cot});
-    if (!text.empty()) cb({tapto::StreamEvent::Kind::Text, text});
-    cb({tapto::StreamEvent::Kind::End, std::string()});
-}
-
 } // namespace
 
 OpenAIClient::OpenAIClient(const AiConfig* config, const std::string& url, const std::string& model, const std::string& apiKey)
@@ -154,100 +141,6 @@ std::string OpenAIClient::getApiKey() {
         return m_apiKeyRef;
     }
     throw std::runtime_error("OpenAI API key is not set");
-}
-
-/// <summary>POSTs a chat completion that asks for a stream, and puts the
-/// streamed reply back together as it arrives.</summary>
-httplib::Result OpenAIClient::post_stream(const httplib::Headers& headers, const std::string& body,
-                                          const CancellationToken* cancel, StreamOutcome& out) {
-    out = StreamOutcome{};
-
-    httplib::Request req;
-    req.method = "POST";
-    req.path = "/v1/chat/completions";
-    req.headers = headers;
-    req.headers.emplace("Accept", "text/event-stream");
-    req.body = body;
-
-    const tapto::StreamCallback& show = m_config->streamCallback();
-    tapto::SseParser parser;
-    tapto::OpenAIStreamAccumulator acc;
-    bool isStream = false;
-    bool done = false;
-    std::size_t events = 0;
-    std::string otherBody; // an error's body, or a whole reply
-
-    auto onEvent = [&](const tapto::SseEvent& ev) {
-        if (done || !out.error.empty()) return;
-        ++events;
-        if (ev.data == "[DONE]") {
-            done = true;
-            return;
-        }
-        json chunk = json::parse(ev.data, nullptr, /*allow_exceptions=*/false);
-        if (chunk.is_discarded()) {
-            mclog("Stream: skipped an event that is not JSON: " + ev.data.substr(0, 200) + "\n");
-            return;
-        }
-        if (ev.event == "error" && !chunk.contains("error")) chunk = {{"error", chunk}};
-        try {
-            const auto delta = acc.add(chunk);
-            if (show) {
-                if (!delta.reasoning.empty()) {
-                    show({tapto::StreamEvent::Kind::Reasoning, delta.reasoning});
-                    out.shown = true;
-                }
-                if (!delta.text.empty()) {
-                    show({tapto::StreamEvent::Kind::Text, delta.text});
-                    out.shown = true;
-                }
-            }
-        } catch (const std::exception& e) {
-            out.error = e.what(); // thrown once the request has returned
-        }
-    };
-
-    req.response_handler = [&](const httplib::Response& r) {
-        isStream = r.status == 200 &&
-                   r.get_header_value("Content-Type").find("text/event-stream") != std::string::npos;
-        return true;
-    };
-    req.content_receiver = [&](const char* data, std::size_t size, uint64_t, uint64_t) {
-        if (!isStream) {
-            otherBody.append(data, size);
-            return true;
-        }
-        parser.feed(data, size, onEvent);
-        if (!out.error.empty()) return false;
-        // ESC is polled each time a piece arrives, so it stops a reply that is
-        // coming in. While the server is silent (a long prompt being read)
-        // nothing arrives, and the poll waits with it. Stopping closes the
-        // connection, which is how the server learns to stop generating.
-        if (cancel && cancel->check()) {
-            out.cancelled = true;
-            return false;
-        }
-        return true;
-    };
-
-    auto res = std::make_unique<httplib::Response>();
-    httplib::Error error = httplib::Error::Success;
-    const bool ok = m_api_client->send(req, *res, error);
-
-    if (isStream) {
-        if (ok) parser.finish(onEvent);
-        if (out.shown) show({tapto::StreamEvent::Kind::End, std::string()});
-        mclog("Stream: " + std::to_string(events) + " event(s)" + (done ? "" : ", no [DONE]") +
-              (out.cancelled ? ", stopped by the user" : "") + "\n");
-        if (!out.error.empty()) throw std::runtime_error(out.error);
-        if (ok || out.cancelled) {
-            out.handled = true;
-            out.response = acc.response(/*interrupted=*/out.cancelled);
-        }
-    }
-    if (!ok) return httplib::Result(nullptr, error);
-    res->body = std::move(otherBody);
-    return httplib::Result(std::move(res), httplib::Error::Success);
 }
 
 /// <summary>Makes API call to OpenAI with retry logic.</summary>
@@ -333,8 +226,10 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
     int server_error_retries = 0;
 
     for (;;) {
-        StreamOutcome streamed;
-        auto res = streaming ? post_stream(headers, body, cancel, streamed)
+        tapto::StreamOutcome streamed;
+        tapto::OpenAIStreamAccumulator acc;
+        auto res = streaming ? tapto::post_stream(*m_api_client, "/v1/chat/completions", headers, body,
+                                                  *m_config, cancel, acc, streamed)
                              : m_api_client->Post("/v1/chat/completions", headers, body, "application/json");
 
         // Stopped by the user partway through: what arrived is the reply.
@@ -402,7 +297,12 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
             } else {
                 resp = json::parse(res->body);
                 // Asked for a stream, answered whole: shown whole.
-                if (streaming && m_config->streamCallback()) showWhole(m_config->streamCallback(), resp);
+                if (streaming && resp.contains("choices") && resp["choices"].is_array() &&
+                    !resp["choices"].empty()) {
+                    const json message = resp["choices"][0].value("message", json::object());
+                    tapto::show_whole(m_config->streamCallback(), extractReasoning(message),
+                                      extractContent(message));
+                }
             }
             // How the provider names the input consumption varies: OpenAI uses
             // usage.input_tokens, but most OpenAI-compatible servers (vLLM,
@@ -673,7 +573,7 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
         mclog("=== Iteration " + std::to_string(iteration) + " ===\n");
 
         // Shown already when the program takes the reply as it streams.
-        const bool shown = showsLive();
+        const bool shown = m_config->showsStream();
         {
             std::string cot = extractReasoning(message);
             if (!cot.empty()) {

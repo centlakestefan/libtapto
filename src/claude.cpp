@@ -14,6 +14,8 @@
 #include "tapto/base64.h"
 #include "tapto/encoding.h"
 #include "tapto/log.h"
+#include "tapto/stream.h"
+#include "stream_post.h"
 #include "tapto/tool_image.h"
 #include "tapto/ui.h"
 #include "tapto/usage.h"
@@ -54,7 +56,8 @@ std::string ClaudeClient::getApiKey() {
 }
 
 /// <summary>Makes API call to Claude with retry logic and caching optimization.</summary>
-json ClaudeClient::call_claude(const std::string& user_message, const json& tools, const json& conversation_history) {
+json ClaudeClient::call_claude(const std::string& user_message, const json& tools, const json& conversation_history,
+                               const CancellationToken* cancel) {
     // Build messages array
     json messages = conversation_history;
     if (!user_message.empty()) {
@@ -152,6 +155,12 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
         request_body["tools"] = cached_tools;
     }
 
+    // Asked as a stream, the reply comes back as the Messages API's events,
+    // which post_stream puts back together into the same message.
+    const bool streaming = m_config->stream();
+    if (streaming) request_body["stream"] = true;
+    const std::string body = request_body.dump();
+
     std::string api_key = getApiKey();
 
     httplib::Headers headers = {
@@ -166,12 +175,29 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
     int server_error_retries = 0;
 
     for (;;) {
-        auto res = m_api_client->Post("/v1/messages", headers, request_body.dump(), "application/json");
+        tapto::StreamOutcome streamed;
+        tapto::ClaudeStreamAccumulator acc;
+        auto res = streaming ? tapto::post_stream(*m_api_client, "/v1/messages", headers, body,
+                                                  *m_config, cancel, acc, streamed)
+                             : m_api_client->Post("/v1/messages", headers, body, "application/json");
+
+        // Stopped by the user partway through: what arrived is the reply.
+        if (streamed.cancelled) {
+            mclog("Reply stopped by the user partway through\n");
+            return streamed.response;
+        }
 
         // Handle connection errors
         if (!res) {
             auto error = res.error();
             std::string error_msg = httplib::to_string(error);
+
+            // Part of the reply is already on the user's screen. Asking again
+            // would show it a second time, and as a different reply.
+            if (streamed.shown) {
+                mclog("Connection lost partway through a streamed reply: " + error_msg + "\n");
+                throw std::runtime_error("The connection was lost partway through the reply: " + error_msg);
+            }
 
             std::ostringstream log_msg;
             log_msg << "Connection failed (attempt " << (connection_retry_count + 1)
@@ -214,7 +240,22 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
 
         // Success
         if (status == 200) {
-            json resp = json::parse(res->body);
+            json resp;
+            if (streamed.handled) {
+                resp = streamed.response;
+            } else {
+                resp = json::parse(res->body);
+                // Asked for a stream, answered whole: shown whole.
+                if (streaming && resp.contains("content") && resp["content"].is_array()) {
+                    std::string thinking, text;
+                    for (const auto& block : resp["content"]) {
+                        const std::string type = block.value("type", std::string());
+                        if (type == "thinking") thinking += block.value("thinking", std::string());
+                        else if (type == "text") text += block.value("text", std::string());
+                    }
+                    tapto::show_whole(m_config->streamCallback(), thinking, text);
+                }
+            }
             // Kept for the caller (context-window fill) and logged so cache
             // behaviour is observable: a cache_read_input_tokens that stays at
             // zero across turns means the prefix is being invalidated, usually
@@ -419,7 +460,7 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
     }
 
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = call_claude("", tools, m_conversation_history);
+    json response = call_claude("", tools, m_conversation_history, context.cancel);
     if (!response.contains("content") || !response.contains("stop_reason")) {
         throw std::runtime_error("Invalid Claude response: " + response.dump());
     }
@@ -445,13 +486,15 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
                 std::string cot = block.value("thinking", std::string());
                 if (!cot.empty()) {
                     mclog("assistant thinks: " + cot + "\n");
-                    ui::emit_intermediate(cot, /*is_reasoning=*/true, m_config->printCot());
+                    if (!m_config->showsStream()) // shown as it streamed
+                        ui::emit_intermediate(cot, /*is_reasoning=*/true, m_config->printCot());
                 }
             }
             else if (block["type"] == "text") {
                 std::string text = block["text"].get<std::string>();
                 mclog("assistant says: " + text + "\n");
-                ui::emit_intermediate(text, /*is_reasoning=*/false, m_config->printCot());
+                if (!m_config->showsStream())
+                    ui::emit_intermediate(text, /*is_reasoning=*/false, m_config->printCot());
             }
             else if (block["type"] == "tool_use") {
                 std::string tool_name = block["name"];
@@ -538,7 +581,7 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = call_claude("", tools, m_conversation_history);
+        response = call_claude("", tools, m_conversation_history, context.cancel);
         if (!response.contains("content") || !response.contains("stop_reason")) {
             throw std::runtime_error("Invalid Claude response: " + response.dump());
         }

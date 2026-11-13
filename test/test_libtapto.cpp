@@ -1368,21 +1368,21 @@ void test_openai_stream_accumulator() {
     {
         tapto::OpenAIStreamAccumulator acc;
         CHECK(!acc.started());
-        auto d = acc.add(chunk({{"role", "assistant"}, {"reasoning_content", "Let me "}}));
+        auto d = acc.addChunk(chunk({{"role", "assistant"}, {"reasoning_content", "Let me "}}));
         CHECK_EQ(d.reasoning, std::string("Let me "));
-        acc.add(chunk({{"reasoning", "look."}}));
-        d = acc.add(chunk({{"content", "Reading."}}));
+        acc.addChunk(chunk({{"reasoning", "look."}}));
+        d = acc.addChunk(chunk({{"content", "Reading."}}));
         CHECK_EQ(d.text, std::string("Reading."));
-        acc.add(chunk({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"}, {"type", "function"},
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"}, {"type", "function"},
                                                      {"function", {{"name", "read"}, {"arguments", ""}}}}})}}));
-        acc.add(chunk({{"tool_calls", json::array({{{"index", 1}, {"id", "t1"},
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"index", 1}, {"id", "t1"},
                                                      {"function", {{"name", "list"}, {"arguments", "{}"}}}}})}}));
-        acc.add(chunk({{"tool_calls", json::array({{{"index", 0}, {"function", {{"arguments", "{\"path\":"}}}}})}}));
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"index", 0}, {"function", {{"arguments", "{\"path\":"}}}}})}}));
         // a server that repeats the id and name in every piece
-        acc.add(chunk({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"},
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"},
                                                      {"function", {{"name", "read"}, {"arguments", "\"a\"}"}}}}})}}));
-        acc.add(chunk(json::object(), "tool_calls"));
-        acc.add({{"id", "c1"}, {"choices", json::array()},
+        acc.addChunk(chunk(json::object(), "tool_calls"));
+        acc.addChunk({{"id", "c1"}, {"choices", json::array()},
                  {"usage", {{"prompt_tokens", 10}, {"completion_tokens", 5}}}});
         CHECK(acc.started());
 
@@ -1407,9 +1407,9 @@ void test_openai_stream_accumulator() {
     // No index: a call goes on until a piece brings a new id. No id: one is made.
     {
         tapto::OpenAIStreamAccumulator acc;
-        acc.add(chunk({{"tool_calls", json::array({{{"function", {{"name", "a"}, {"arguments", "{\"x\""}}}}})}}));
-        acc.add(chunk({{"tool_calls", json::array({{{"function", {{"arguments", ":1}"}}}}})}}));
-        acc.add(chunk({{"tool_calls", json::array({{{"id", "b1"}, {"function", {{"name", "b"}, {"arguments", {{"y", 2}}}}}}})}}));
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"function", {{"name", "a"}, {"arguments", "{\"x\""}}}}})}}));
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"function", {{"arguments", ":1}"}}}}})}}));
+        acc.addChunk(chunk({{"tool_calls", json::array({{{"id", "b1"}, {"function", {{"name", "b"}, {"arguments", {{"y", 2}}}}}}})}}));
         const json msg = acc.response()["choices"][0]["message"];
         CHECK(msg["content"].is_null());
         CHECK_EQ(msg["tool_calls"].size(), std::size_t(2));
@@ -1422,7 +1422,7 @@ void test_openai_stream_accumulator() {
     // An interrupted reply with nothing finished says so.
     {
         tapto::OpenAIStreamAccumulator acc;
-        acc.add(chunk({{"content", "Hal"}}));
+        acc.addChunk(chunk({{"content", "Hal"}}));
         CHECK_EQ(acc.response(true)["choices"][0]["finish_reason"].get<std::string>(), std::string("interrupted"));
         CHECK_EQ(acc.response()["choices"][0]["finish_reason"].get<std::string>(), std::string("stop"));
     }
@@ -1432,7 +1432,7 @@ void test_openai_stream_accumulator() {
         tapto::OpenAIStreamAccumulator acc;
         bool threw = false;
         try {
-            acc.add({{"error", {{"message", "overloaded"}}}});
+            acc.addChunk({{"error", {{"message", "overloaded"}}}});
         } catch (const std::runtime_error& e) {
             threw = std::string(e.what()).find("overloaded") != std::string::npos;
         }
@@ -1593,6 +1593,314 @@ void test_openai_streamed_chat() {
         CHECK(!m.contains("tool_calls"));
     }
     CHECK(shown.empty() || (shown.size() >= 5 && shown.compare(shown.size() - 5, 5, "[end]") == 0));
+
+    server.stop();
+    listener.join();
+}
+
+// --- streaming: claude and gemini ----------------------------------------------
+
+// An event-stream body: each event's name (empty for none) and data.
+std::string sse_body(const std::vector<std::pair<std::string, json>>& events) {
+    std::string body;
+    for (const auto& [name, data] : events) {
+        if (!name.empty()) body += "event: " + name + "\n";
+        body += "data: " + data.dump() + "\n\n";
+    }
+    return body;
+}
+
+// Serves `body` as an event stream in small pieces.
+void serve_sse(httplib::Response& res, const std::string& body) {
+    res.set_chunked_content_provider("text/event-stream", [body](size_t, httplib::DataSink& sink) {
+        for (std::size_t at = 0; at < body.size(); at += 11) {
+            sink.write(body.data() + at, (std::min<std::size_t>)(11, body.size() - at));
+        }
+        sink.done();
+        return true;
+    });
+}
+
+// A program's stream callback, written down: [r] reasoning, [t] text, [end].
+tapto::StreamCallback recorder(std::string& shown) {
+    return [&shown](const tapto::StreamEvent& ev) {
+        switch (ev.kind) {
+        case tapto::StreamEvent::Kind::Reasoning: shown += "[r]" + ev.text; break;
+        case tapto::StreamEvent::Kind::Text: shown += "[t]" + ev.text; break;
+        case tapto::StreamEvent::Kind::End: shown += "[end]"; break;
+        }
+    };
+}
+
+// A Messages API stream: a thought with its signature, text, and a tool_use
+// whose input arrives in pieces.
+std::vector<std::pair<std::string, json>> claude_tool_events() {
+    auto delta = [](int index, json d) {
+        return std::make_pair(std::string("content_block_delta"),
+                              json{{"type", "content_block_delta"}, {"index", index}, {"delta", d}});
+    };
+    auto start = [](int index, json block) {
+        return std::make_pair(std::string("content_block_start"),
+                              json{{"type", "content_block_start"}, {"index", index}, {"content_block", block}});
+    };
+    auto stop = [](int index) {
+        return std::make_pair(std::string("content_block_stop"),
+                              json{{"type", "content_block_stop"}, {"index", index}});
+    };
+    return {
+        {"message_start", {{"type", "message_start"},
+                           {"message", {{"id", "msg_1"}, {"type", "message"}, {"role", "assistant"},
+                                        {"model", "m"}, {"content", json::array()}, {"stop_reason", nullptr},
+                                        {"usage", {{"input_tokens", 12}, {"output_tokens", 1},
+                                                   {"cache_read_input_tokens", 4}}}}}}},
+        start(0, {{"type", "thinking"}, {"thinking", ""}, {"signature", ""}}),
+        {"ping", {{"type", "ping"}}},
+        delta(0, {{"type", "thinking_delta"}, {"thinking", "Need "}}),
+        delta(0, {{"type", "thinking_delta"}, {"thinking", "the tool."}}),
+        delta(0, {{"type", "signature_delta"}, {"signature", "sig"}}),
+        stop(0),
+        start(1, {{"type", "text"}, {"text", ""}}),
+        delta(1, {{"type", "text_delta"}, {"text", "Reading."}}),
+        stop(1),
+        start(2, {{"type", "tool_use"}, {"id", "t0"}, {"name", "echo"}, {"input", json::object()}}),
+        delta(2, {{"type", "input_json_delta"}, {"partial_json", "{\"s\":"}}),
+        delta(2, {{"type", "input_json_delta"}, {"partial_json", "\"hi\"}"}}),
+        stop(2),
+        {"message_delta", {{"type", "message_delta"},
+                           {"delta", {{"stop_reason", "tool_use"}, {"stop_sequence", nullptr}}},
+                           {"usage", {{"output_tokens", 30}}}}},
+        {"message_stop", {{"type", "message_stop"}}},
+    };
+}
+
+void test_claude_stream_accumulator() {
+    {
+        tapto::ClaudeStreamAccumulator acc;
+        std::string reasoning, text;
+        for (const auto& [name, data] : claude_tool_events()) {
+            const auto d = acc.add({name, data.dump()});
+            reasoning += d.reasoning;
+            text += d.text;
+        }
+        CHECK(acc.done());
+        CHECK_EQ(reasoning, std::string("Need the tool."));
+        CHECK_EQ(text, std::string("Reading."));
+
+        const json msg = acc.response();
+        CHECK_EQ(msg["id"].get<std::string>(), std::string("msg_1"));
+        CHECK_EQ(msg["stop_reason"].get<std::string>(), std::string("tool_use"));
+        CHECK_EQ(msg["usage"]["input_tokens"].get<int>(), 12);
+        CHECK_EQ(msg["usage"]["output_tokens"].get<int>(), 30);
+        CHECK_EQ(msg["usage"]["cache_read_input_tokens"].get<int>(), 4);
+        CHECK_EQ(msg["content"].size(), std::size_t(3));
+        if (msg["content"].size() == 3) {
+            CHECK_EQ(msg["content"][0]["thinking"].get<std::string>(), std::string("Need the tool."));
+            CHECK_EQ(msg["content"][0]["signature"].get<std::string>(), std::string("sig"));
+            CHECK_EQ(msg["content"][1]["text"].get<std::string>(), std::string("Reading."));
+            CHECK_EQ(msg["content"][2]["input"], json({{"s", "hi"}}));
+        }
+
+        const json cut = acc.response(true); // no tool_use when interrupted
+        CHECK_EQ(cut["content"].size(), std::size_t(2));
+    }
+
+    // Interrupted mid-thought: the thought has no signature yet, so it is
+    // not sent back, and the message still has content.
+    {
+        tapto::ClaudeStreamAccumulator acc;
+        const auto events = claude_tool_events();
+        for (std::size_t i = 0; i < 4; ++i) acc.add({events[i].first, events[i].second.dump()});
+        const json cut = acc.response(true);
+        CHECK_EQ(cut["content"].size(), std::size_t(1));
+        if (cut["content"].size() == 1) {
+            CHECK_EQ(cut["content"][0]["type"].get<std::string>(), std::string("text"));
+        }
+        CHECK_EQ(cut["stop_reason"].get<std::string>(), std::string("interrupted"));
+    }
+
+    // overloaded_error after the 200, with or without the event name.
+    for (const char* name : {"error", ""}) {
+        tapto::ClaudeStreamAccumulator acc;
+        bool threw = false;
+        try {
+            acc.add({name, json{{"type", "error"},
+                                {"error", {{"type", "overloaded_error"}, {"message", "Overloaded"}}}}.dump()});
+        } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()).find("overloaded_error: Overloaded") != std::string::npos;
+        }
+        CHECK(threw);
+    }
+}
+
+void test_gemini_stream_accumulator() {
+    auto ev = [](json parts, json extra = json::object()) {
+        json cand = {{"content", {{"role", "model"}, {"parts", parts}}}};
+        for (auto it = extra.begin(); it != extra.end(); ++it) cand[it.key()] = it.value();
+        return tapto::SseEvent{"", json{{"candidates", json::array({cand})}}.dump()};
+    };
+    tapto::GeminiStreamAccumulator acc;
+    auto d = acc.add(ev(json::array({{{"text", "Need "}, {"thought", true}}})));
+    CHECK_EQ(d.reasoning, std::string("Need "));
+    acc.add(ev(json::array({{{"text", "the tool."}, {"thought", true}, {"thoughtSignature", "ts"}}})));
+    d = acc.add(ev(json::array({{{"text", "Reading."}}})));
+    CHECK_EQ(d.text, std::string("Reading."));
+    acc.add(ev(json::array({{{"functionCall", {{"name", "echo"}, {"args", {{"s", "hi"}}}}}}}),
+               {{"finishReason", "STOP"}}));
+    acc.add({"", json{{"candidates", json::array()},
+                      {"usageMetadata", {{"promptTokenCount", 5}, {"candidatesTokenCount", 3}}}}.dump()});
+
+    const json resp = acc.response();
+    const json parts = resp["candidates"][0]["content"]["parts"];
+    CHECK_EQ(parts.size(), std::size_t(3));
+    if (parts.size() == 3) {
+        CHECK_EQ(parts[0]["text"].get<std::string>(), std::string("Need the tool."));
+        CHECK_EQ(parts[0]["thoughtSignature"].get<std::string>(), std::string("ts"));
+        CHECK_EQ(parts[1]["text"].get<std::string>(), std::string("Reading."));
+        CHECK_EQ(parts[2]["functionCall"]["name"].get<std::string>(), std::string("echo"));
+    }
+    CHECK_EQ(resp["candidates"][0]["finishReason"].get<std::string>(), std::string("STOP"));
+    CHECK_EQ(resp["usageMetadata"]["promptTokenCount"].get<int>(), 5);
+    CHECK_EQ(acc.response(true)["candidates"][0]["content"]["parts"].size(), std::size_t(2));
+
+    // An interrupted reply with nothing in it still has a part to send back.
+    tapto::GeminiStreamAccumulator empty;
+    CHECK_EQ(empty.response(true)["candidates"][0]["content"]["parts"].size(), std::size_t(1));
+}
+
+// A streamed tool round and answer for claude and for gemini, against a
+// local server: shown as it arrives, returned whole, the history as the next
+// request sends it, the usage reported.
+void test_claude_gemini_streamed_chat() {
+    httplib::Server server;
+    std::vector<std::string> paths;
+    std::vector<json> requests;
+
+    server.Post(R"(.*)", [&](const httplib::Request& req, httplib::Response& res) {
+        paths.push_back(req.path + (req.params.empty() ? "" : "?alt=" + req.get_param_value("alt")));
+        requests.push_back(json::parse(req.body));
+        const bool first = requests.size() == 1;
+        if (req.path == "/v1/messages") {
+            if (first) {
+                serve_sse(res, sse_body(claude_tool_events()));
+                return;
+            }
+            serve_sse(res, sse_body({
+                {"message_start", {{"type", "message_start"},
+                                   {"message", {{"id", "msg_2"}, {"role", "assistant"},
+                                                {"usage", {{"input_tokens", 20}}}}}}},
+                {"content_block_start", {{"type", "content_block_start"}, {"index", 0},
+                                         {"content_block", {{"type", "text"}, {"text", ""}}}}},
+                {"content_block_delta", {{"type", "content_block_delta"}, {"index", 0},
+                                         {"delta", {{"type", "text_delta"}, {"text", "Done: "}}}}},
+                {"content_block_delta", {{"type", "content_block_delta"}, {"index", 0},
+                                         {"delta", {{"type", "text_delta"}, {"text", "hi"}}}}},
+                {"content_block_stop", {{"type", "content_block_stop"}, {"index", 0}}},
+                {"message_delta", {{"type", "message_delta"}, {"delta", {{"stop_reason", "end_turn"}}},
+                                   {"usage", {{"output_tokens", 2}}}}},
+                {"message_stop", {{"type", "message_stop"}}},
+            }));
+            return;
+        }
+        auto cand = [](json parts, json extra = json::object()) {
+            json c = {{"content", {{"role", "model"}, {"parts", parts}}}};
+            for (auto it = extra.begin(); it != extra.end(); ++it) c[it.key()] = it.value();
+            return std::make_pair(std::string(), json{{"candidates", json::array({c})}});
+        };
+        if (first) {
+            serve_sse(res, sse_body({
+                cand(json::array({{{"text", "Need "}, {"thought", true}}})),
+                cand(json::array({{{"text", "the tool."}, {"thought", true}}})),
+                cand(json::array({{{"functionCall", {{"name", "echo"}, {"args", {{"s", "hi"}}}}},
+                                   {"thoughtSignature", "ts"}}}),
+                     {{"finishReason", "STOP"}}),
+                {"", {{"candidates", json::array()}, {"usageMetadata", {{"promptTokenCount", 5}}}}},
+            }));
+            return;
+        }
+        serve_sse(res, sse_body({
+            cand(json::array({{{"text", "Done: "}}})),
+            {"", {{"candidates", json::array({{{"content", {{"role", "model"},
+                                                            {"parts", json::array({{{"text", "hi"}}})}}},
+                                               {"finishReason", "STOP"}}})},
+                  {"usageMetadata", {{"promptTokenCount", 9}, {"candidatesTokenCount", 2}}}}},
+        }));
+    });
+    const int port = server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    if (port <= 0) return;
+    std::thread listener([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    for (const std::string dialect : {"claude", "gemini"}) {
+        paths.clear();
+        requests.clear();
+        AiConfig cfg;
+        cfg.setStream(true);
+        std::string shown;
+        cfg.setStreamCallback(recorder(shown));
+        std::vector<tapto::TokenUsage> told;
+        cfg.setUsageCallback([&](const tapto::TokenUsage& u) { told.push_back(u); });
+
+        ToolSpec echo;
+        echo.name = "echo";
+        echo.description = "echo";
+        std::string echoed;
+        echo.executor = [&](Context&, const json& in) {
+            echoed = in.value("s", std::string());
+            return echoed;
+        };
+
+        std::unique_ptr<AiBackend> client;
+        if (dialect == "claude") client = std::make_unique<ClaudeClient>(&cfg, url, "m", "k");
+        else client = std::make_unique<GeminiClient>(&cfg, url, "m", "k");
+        client->start();
+        Context ctx;
+        ctx.tools.push_back(echo);
+        std::string reply;
+        try {
+            reply = client->chat(ctx, "say hi");
+        } catch (const std::exception& e) {
+            std::cerr << dialect << " streamed chat: " << e.what() << "\n";
+            CHECK(false);
+        }
+
+        CHECK_EQ(reply, std::string("Done: hi"));
+        CHECK_EQ(echoed, std::string("hi"));
+        CHECK_EQ(told.size(), std::size_t(2));
+        CHECK_EQ(requests.size(), std::size_t(2));
+        const json history = client->getHistory();
+        if (dialect == "claude") {
+            CHECK_EQ(shown, std::string("[r]Need [r]the tool.[t]Reading.[end][t]Done: [t]hi[end]"));
+            if (!requests.empty()) CHECK(requests[0].value("stream", false));
+            if (!paths.empty()) CHECK_EQ(paths[0], std::string("/v1/messages"));
+            if (told.size() == 2) {
+                CHECK_EQ(told[0].output, std::uint64_t(30));
+                CHECK_EQ(told[0].cache_read, std::uint64_t(4));
+            }
+            // The thought goes back with its signature, the call with its input whole.
+            if (history.size() >= 2) {
+                const json content = history[1]["content"];
+                CHECK_EQ(content.size(), std::size_t(3));
+                if (content.size() == 3) {
+                    CHECK_EQ(content[0]["signature"].get<std::string>(), std::string("sig"));
+                    CHECK_EQ(content[2]["input"], json({{"s", "hi"}}));
+                }
+            }
+        } else {
+            CHECK_EQ(shown, std::string("[r]Need [r]the tool.[end][t]Done: [t]hi[end]"));
+            if (!paths.empty()) CHECK_EQ(paths[0], std::string("/v1beta/models/m:streamGenerateContent?alt=sse"));
+            if (told.size() == 2) CHECK_EQ(told[1].output, std::uint64_t(2));
+            if (history.size() >= 2) {
+                const json parts = history[1]["parts"];
+                CHECK_EQ(parts.size(), std::size_t(2));
+                if (parts.size() == 2) {
+                    CHECK_EQ(parts[0]["text"].get<std::string>(), std::string("Need the tool."));
+                    CHECK_EQ(parts[1]["thoughtSignature"].get<std::string>(), std::string("ts"));
+                }
+            }
+        }
+    }
 
     server.stop();
     listener.join();
@@ -2005,6 +2313,9 @@ int main() {
     test_sse_parser();
     test_openai_stream_accumulator();
     test_openai_streamed_chat();
+    test_claude_stream_accumulator();
+    test_gemini_stream_accumulator();
+    test_claude_gemini_streamed_chat();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed\n";

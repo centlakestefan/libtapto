@@ -28,6 +28,9 @@ public:
     const tapto::RetryCallback& retryCallback() const { return m_retryCallback; }
     bool stream() const { return m_stream; }
     const tapto::StreamCallback& streamCallback() const { return m_streamCallback; }
+    // Whether the pieces of a reply reach the program as they arrive, so the
+    // clients do not show them again through ui::emit_intermediate.
+    bool showsStream() const { return m_stream && static_cast<bool>(m_streamCallback); }
 
     void setMaxOutputTokens(int v) { m_maxOutputTokens = v; }
     void setMaxToolIterations(int v) { m_maxToolIterations = v; }
@@ -102,9 +105,9 @@ private:
 
     // Ask for the reply as a stream (tapto/stream.h). The reply comes back the
     // same, but the read timeout becomes the longest silence instead of the
-    // whole generation, and ESC stops a reply partway through. Only the openai
-    // dialect streams so far; the others ignore it. Off by default: a program
-    // opts in.
+    // whole generation, and ESC stops a reply partway through. Every dialect
+    // streams: openai's chunks, claude's Messages events and gemini's
+    // streamGenerateContent. Off by default: a program opts in.
     bool m_stream = false;
 
     // Told each piece of a streamed reply as it arrives. When set, the pieces

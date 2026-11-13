@@ -107,19 +107,44 @@ std::string str(const json& o, const char* key) {
     return it->get<std::string>();
 }
 
+// An event's data as JSON, or a discarded value when it is not JSON.
+json parse_event(const SseEvent& ev) {
+    return json::parse(ev.data, nullptr, /*allow_exceptions=*/false);
+}
+
+// The message of an `error` object, or the object itself as text.
+std::string error_text(const json& err) {
+    if (err.is_object()) {
+        std::string message = str(err, "message");
+        const std::string type = str(err, "type");
+        if (!message.empty()) return type.empty() ? message : type + ": " + message;
+    }
+    return err.is_string() ? err.get<std::string>() : err.dump();
+}
+
+[[noreturn]] void throw_stream_error(const json& err) {
+    throw std::runtime_error("The server reported an error partway through the reply: " + error_text(err));
+}
+
 } // namespace
 
-OpenAIStreamAccumulator::Delta OpenAIStreamAccumulator::add(const json& chunk) {
-    Delta out;
+StreamDelta OpenAIStreamAccumulator::add(const SseEvent& ev) {
+    if (ev.data == "[DONE]") {
+        m_done = true;
+        return {};
+    }
+    json chunk = parse_event(ev);
+    if (chunk.is_discarded()) return {}; // not JSON: nothing a reply is made of
+    if (ev.event == "error" && !chunk.contains("error")) throw_stream_error(chunk);
+    return addChunk(chunk);
+}
+
+StreamDelta OpenAIStreamAccumulator::addChunk(const json& chunk) {
+    StreamDelta out;
     if (!chunk.is_object()) return out;
 
     // An error after the 200: the server gave up partway through.
-    if (chunk.contains("error") && !chunk["error"].is_null()) {
-        const json& err = chunk["error"];
-        std::string message = err.is_object() ? str(err, "message") : std::string();
-        if (message.empty()) message = err.dump();
-        throw std::runtime_error("The server reported an error partway through the reply: " + message);
-    }
+    if (chunk.contains("error") && !chunk["error"].is_null()) throw_stream_error(chunk["error"]);
 
     if (m_id.empty()) m_id = str(chunk, "id");
     if (m_model.empty()) m_model = str(chunk, "model");
@@ -236,6 +261,204 @@ json OpenAIStreamAccumulator::response(bool interrupted) const {
     if (!m_id.empty()) resp["id"] = m_id;
     if (!m_model.empty()) resp["model"] = m_model;
     if (!m_usage.is_null()) resp["usage"] = m_usage;
+    return resp;
+}
+
+// --- ClaudeStreamAccumulator --------------------------------------------------
+
+StreamDelta ClaudeStreamAccumulator::add(const SseEvent& ev) {
+    StreamDelta out;
+    const json data = parse_event(ev);
+    if (data.is_discarded() || !data.is_object()) return out;
+
+    // The event's name is in both the `event:` field and the data's `type`;
+    // a proxy may drop the first, so the second decides.
+    std::string type = str(data, "type");
+    if (type.empty()) type = ev.event;
+
+    if (type == "error" || (data.contains("error") && data["error"].is_object())) {
+        throw_stream_error(data.value("error", data));
+    }
+    if (type == "message_start") {
+        m_message = data.value("message", json::object());
+        m_message.erase("content"); // filled from the blocks
+        return out;
+    }
+    if (type == "message_delta") {
+        const json delta = data.value("delta", json::object());
+        for (auto it = delta.begin(); it != delta.end(); ++it) m_message[it.key()] = it.value();
+        if (data.contains("usage") && data["usage"].is_object()) {
+            json& usage = m_message["usage"];
+            if (!usage.is_object()) usage = json::object();
+            for (auto it = data["usage"].begin(); it != data["usage"].end(); ++it) {
+                if (!it.value().is_null()) usage[it.key()] = it.value();
+            }
+        }
+        return out;
+    }
+    if (type == "message_stop") {
+        m_done = true;
+        return out;
+    }
+
+    const int index = data.value("index", -1);
+    if (index < 0) return out; // ping, and anything else not about a block
+
+    if (type == "content_block_start") {
+        Block& b = m_blocks[index];
+        b.block = data.value("content_block", json::object());
+        // Text a block starts with (rare, but allowed) is shown too.
+        const std::string kind = str(b.block, "type");
+        if (kind == "text") out.text += str(b.block, "text");
+        else if (kind == "thinking") out.reasoning += str(b.block, "thinking");
+        return out;
+    }
+    if (type == "content_block_stop") {
+        m_blocks[index].stopped = true;
+        return out;
+    }
+    if (type != "content_block_delta") return out;
+
+    Block& b = m_blocks[index];
+    const json delta = data.value("delta", json::object());
+    const std::string kind = str(delta, "type");
+    if (kind == "text_delta") {
+        const std::string piece = str(delta, "text");
+        b.block["text"] = str(b.block, "text") + piece;
+        out.text += piece;
+    } else if (kind == "thinking_delta") {
+        const std::string piece = str(delta, "thinking");
+        b.block["thinking"] = str(b.block, "thinking") + piece;
+        out.reasoning += piece;
+    } else if (kind == "signature_delta") {
+        b.block["signature"] = str(b.block, "signature") + str(delta, "signature");
+    } else if (kind == "input_json_delta") {
+        b.inputJson += str(delta, "partial_json");
+    } else if (kind == "citations_delta") {
+        if (!b.block["citations"].is_array()) b.block["citations"] = json::array();
+        b.block["citations"].push_back(delta.value("citation", json::object()));
+    }
+    return out;
+}
+
+json ClaudeStreamAccumulator::response(bool interrupted) const {
+    json message = m_message;
+    if (!message.contains("type")) message["type"] = "message";
+    if (!message.contains("role")) message["role"] = "assistant";
+
+    json content = json::array();
+    for (const auto& [index, b] : m_blocks) {
+        json block = b.block;
+        const std::string kind = str(block, "type");
+        if (kind == "tool_use" || kind == "server_tool_use") {
+            if (interrupted) continue; // will not run
+            if (!b.inputJson.empty()) {
+                json input = json::parse(b.inputJson, nullptr, /*allow_exceptions=*/false);
+                block["input"] = input.is_discarded() ? json::object() : input;
+            } else if (!block.contains("input") || !block["input"].is_object()) {
+                block["input"] = json::object();
+            }
+        } else if (kind == "thinking") {
+            // A thought is sent back with its signature or not at all.
+            if (interrupted && (!b.stopped || str(block, "signature").empty())) continue;
+        } else if (kind == "text") {
+            if (str(block, "text").empty()) continue; // an empty text block is rejected
+        } else if (interrupted && !b.stopped) {
+            continue;
+        }
+        content.push_back(block);
+    }
+    // An assistant message needs content, and an interrupted one may have none.
+    if (content.empty() && interrupted) {
+        content.push_back({{"type", "text"}, {"text", "(interrupted)"}});
+    }
+    message["content"] = content;
+
+    if (!message.contains("stop_reason") || message["stop_reason"].is_null()) {
+        message["stop_reason"] = interrupted ? "interrupted" : "end_turn";
+    }
+    return message;
+}
+
+// --- GeminiStreamAccumulator --------------------------------------------------
+
+StreamDelta GeminiStreamAccumulator::add(const SseEvent& ev) {
+    StreamDelta out;
+    const json data = parse_event(ev);
+    if (data.is_discarded()) return out;
+    // A stream may be a JSON array of responses when alt=sse was not honoured
+    // by a proxy; each element is read the same way.
+    if (data.is_array()) {
+        for (const auto& element : data) {
+            SseEvent one{ev.event, element.dump()};
+            const StreamDelta d = add(one);
+            out.reasoning += d.reasoning;
+            out.text += d.text;
+        }
+        return out;
+    }
+    if (!data.is_object()) return out;
+    if (data.contains("error")) throw_stream_error(data["error"]);
+
+    if (data.contains("usageMetadata") && data["usageMetadata"].is_object()) m_usage = data["usageMetadata"];
+    if (m_modelVersion.empty()) m_modelVersion = str(data, "modelVersion");
+
+    const json candidates = data.value("candidates", json::array());
+    if (!candidates.is_array() || candidates.empty() || !candidates[0].is_object()) return out;
+    const json& cand = candidates[0];
+    for (auto it = cand.begin(); it != cand.end(); ++it) {
+        if (it.key() != "content" && !it.value().is_null()) m_candidate[it.key()] = it.value();
+    }
+
+    const json parts = cand.value("content", json::object()).value("parts", json::array());
+    if (!parts.is_array()) return out;
+    for (const auto& part : parts) {
+        if (!part.is_object()) continue;
+        if (part.contains("text") && part["text"].is_string()) {
+            const std::string piece = part["text"].get<std::string>();
+            const bool thought = part.value("thought", false);
+            if (thought) out.reasoning += piece;
+            else out.text += piece;
+
+            // Joined to the text part before it when that is the same kind
+            // and carries nothing else; a signature goes with the joined part.
+            json* prev = m_parts.empty() ? nullptr : &m_parts.back();
+            const bool joins = prev && prev->contains("text") && (*prev)["text"].is_string() &&
+                               prev->value("thought", false) == thought &&
+                               !prev->contains("thoughtSignature");
+            if (joins) {
+                (*prev)["text"] = (*prev)["text"].get<std::string>() + piece;
+                for (auto f = part.begin(); f != part.end(); ++f) {
+                    if (f.key() != "text") (*prev)[f.key()] = f.value();
+                }
+                continue;
+            }
+        }
+        m_parts.push_back(part);
+    }
+    return out;
+}
+
+json GeminiStreamAccumulator::response(bool interrupted) const {
+    json parts = json::array();
+    for (const auto& part : m_parts) {
+        if (interrupted && part.contains("functionCall")) continue; // will not run
+        if (part.contains("text") && part["text"].is_string() && part["text"].get<std::string>().empty() &&
+            !part.contains("thoughtSignature")) {
+            continue;
+        }
+        parts.push_back(part);
+    }
+    // A model turn needs a part, and an interrupted one may have none.
+    if (parts.empty() && interrupted) parts.push_back({{"text", "(interrupted)"}});
+
+    json candidate = m_candidate;
+    candidate["content"] = {{"role", "model"}, {"parts", parts}};
+    if (interrupted && !candidate.contains("finishReason")) candidate["finishReason"] = "INTERRUPTED";
+
+    json resp = {{"candidates", json::array({candidate})}};
+    if (!m_usage.is_null()) resp["usageMetadata"] = m_usage;
+    if (!m_modelVersion.empty()) resp["modelVersion"] = m_modelVersion;
     return resp;
 }
 

@@ -140,6 +140,7 @@ add_library(tapto STATIC
   src/certs.cpp
   src/tool_image.cpp
   src/stream.cpp
+  src/stream_post.cpp
 )
 add_library(tapto::tapto ALIAS tapto)
 

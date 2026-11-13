@@ -55,27 +55,6 @@ private:
 
     void init_api_client();
 
-    // What a streamed request came to, beside the HTTP result: `handled` when
-    // the body was an event stream and `response` holds the reply put back
-    // together; `cancelled` when ESC stopped it, `response` then holding what
-    // had arrived; `shown` when any of it reached the stream callback.
-    struct StreamOutcome {
-        bool handled = false;
-        bool cancelled = false;
-        bool shown = false;
-        std::string error;
-        nlohmann::json response;
-    };
-
-    // POSTs the request asking for a stream. An error status's body, and the
-    // body of a server that answered with a whole reply instead, come back in
-    // the result as usual.
-    httplib::Result post_stream(const httplib::Headers& headers, const std::string& body,
-                                const CancellationToken* cancel, StreamOutcome& out);
-
-    // Whether the pieces of a reply reach the program as they arrive.
-    bool showsLive() const { return m_config->stream() && static_cast<bool>(m_config->streamCallback()); }
-
     // Resolves the OpenAI API key. Stubbed to read the environment variable
     // named by m_apiKeyRef until wired to the tapto-code config store.
     std::string getApiKey();
