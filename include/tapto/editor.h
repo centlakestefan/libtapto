@@ -19,6 +19,8 @@ namespace tapto {
 // edits land in the editor, where the user can undo them. Text is UTF-8 with
 // the document's own line endings. Called on the thread that runs the tool,
 // with a path the PathRules have already allowed.
+class TempFolder;
+
 class Buffers {
 public:
     enum class Result {
@@ -50,7 +52,12 @@ public:
 //
 // With `buffers`, view, write, str_replace and insert go to a document that
 // holds the file before the disk; create, delete and find_files use the disk.
+//
+// A find_files result too long for the context goes to `temp`, the session's
+// @tmp (tapto/overflow.h), with its head and tail inline; without one, to the
+// process's default_temp_folder(). `temp` must outlive the returned specs.
 std::vector<ToolSpec> editor_tools(const FolderSet& folders,
-                                   std::shared_ptr<Buffers> buffers = nullptr);
+                                   std::shared_ptr<Buffers> buffers = nullptr,
+                                   TempFolder* temp = nullptr);
 
 } // namespace tapto

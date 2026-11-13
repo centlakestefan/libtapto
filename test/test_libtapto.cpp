@@ -47,6 +47,7 @@
 #include "tapto/pathrules.h"
 #include "tapto/program.h"
 #include "tapto/fstools.h"
+#include "tapto/overflow.h"
 #include "tapto/policy.h"
 #include "tapto/provider.h"
 #include "tapto/secret.h"
@@ -1372,6 +1373,51 @@ void test_editor_without_home() {
     tapto::set_program_name("tapto");
 }
 
+// find_files within bounds: a long matching line shown only in part, a
+// stop at 100 files said, and a result too long for the context in the
+// session's @tmp with its head and tail inline.
+void test_find_files_bounds() {
+    Tree t("find-files-bounds");
+    tapto::FolderSet set;
+    CHECK_EQ(set.set_home((t.root / "proj").string(), /*writable=*/true), std::string());
+    tapto::TempFolder temp;
+    fs::create_directories(t.root / "tmp");
+    temp.use(t.root / "tmp", "@tmp");
+    const auto tools = tapto::editor_tools(set, nullptr, &temp);
+
+    // one minified line: its start, and how long it is
+    Tree::write(t.root / "proj" / "min.js", std::string(5000, 'x') + "needle" + std::string(5000, 'y') + "\n");
+    std::string r = run(tools, "find_files", json{{"filename", "min.js"}, {"search_string", "needle"}});
+    CHECK(contains(r, "min.js"));
+    CHECK(contains(r, "(10006 bytes)"));
+    CHECK(r.size() < 1000);
+
+    // more than 100 files: the stop is said
+    fs::create_directories(t.root / "proj" / "many");
+    for (int i = 0; i < 120; ++i) Tree::write(t.root / "proj" / "many" / ("f" + std::to_string(i) + ".txt"), "a\n");
+    r = run(tools, "find_files", json{{"filename", "*.txt"}, {"path", "many"}});
+    CHECK(contains(r, "Found 100 file(s)"));
+    CHECK(contains(r, "Stopped at 100 files"));
+    r = run(tools, "find_files", json{{"filename", "f1?.txt"}, {"path", "many"}});
+    CHECK(!contains(r, "Stopped at"));
+
+    // too long for the context: the whole of it in @tmp
+    fs::create_directories(t.root / "proj" / "big");
+    std::string lines;
+    for (int i = 0; i < 20; ++i) lines += "needle " + std::string(250, 'z') + "\n";
+    for (int i = 0; i < 30; ++i) Tree::write(t.root / "proj" / "big" / ("b" + std::to_string(i) + ".txt"), lines);
+    r = run(tools, "find_files", json{{"filename", "*.txt"}, {"path", "big"}, {"search_string", "needle"}});
+    CHECK(contains(r, "the output was cut"));
+    CHECK(contains(r, "@tmp/find_files"));
+    CHECK(r.size() < 20000);
+    std::size_t kept = 0;
+    for (const auto& e : fs::directory_iterator(t.root / "tmp")) {
+        (void)e;
+        ++kept;
+    }
+    CHECK_EQ(kept, std::size_t(1));
+}
+
 // A document open in an editor: one map entry per file, holding its text.
 struct FakeBuffers : tapto::Buffers {
     std::map<fs::path, std::string> open;
@@ -1701,6 +1747,7 @@ int main() {
     test_folder_tools();
     test_editor_without_home();
     test_editor_buffers();
+    test_find_files_bounds();
     test_command_tools();
     test_program_keys_and_commands();
     test_certificates();
