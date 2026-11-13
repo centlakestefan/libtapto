@@ -1392,32 +1392,52 @@ void test_find_files_bounds() {
     CHECK(contains(r, "(10006 bytes)"));
     CHECK(r.size() < 1000);
 
-    // more than 100 files: all of them
+    // The one file in @tmp, as lines (1-based: [0] is empty), and empty it.
+    const auto saved_lines = [&] {
+        std::vector<std::string> lines{""};
+        std::size_t files = 0;
+        for (const auto& e : fs::directory_iterator(t.root / "tmp")) {
+            ++files;
+            std::ifstream in(e.path(), std::ios::binary);
+            for (std::string line; std::getline(in, line);) lines.push_back(line);
+        }
+        CHECK_EQ(files, std::size_t(1));
+        fs::remove_all(t.root / "tmp");
+        fs::create_directories(t.root / "tmp");
+        return lines;
+    };
+
+    // more than 100 files: 100 shown, all of them in @tmp, and where the rest are
     fs::create_directories(t.root / "proj" / "many");
     for (int i = 0; i < 120; ++i) Tree::write(t.root / "proj" / "many" / ("f" + std::to_string(i) + ".txt"), "a\n");
     r = run(tools, "find_files", json{{"filename", "*.txt"}, {"path", "many"}});
-    CHECK(contains(r, "Found 120 file(s)"));
+    CHECK(contains(r, "Found 120 file(s), the first 100 shown"));
+    CHECK(contains(r, "[20 more files: lines 103-122 of @tmp/find_files"));
     CHECK(!contains(r, "Stopped at"));
+    {
+        const auto saved = saved_lines();
+        CHECK_EQ(saved.size(), std::size_t(123));
+        CHECK(contains(saved[1], "Found 120 file(s):"));
+        CHECK(contains(saved[103], ".txt"));
+        CHECK(contains(saved[122], ".txt"));
+    }
+    r = run(tools, "find_files", json{{"filename", "f1?.txt"}, {"path", "many"}});
+    CHECK(contains(r, "Found 10 file(s):"));
+    CHECK(!contains(r, "@tmp"));
 
-    // more than 20 matches in one file (the vouchers of an SIE file): all of
-    // them, in @tmp when too long to show
+    // more than 20 matches in one file (the vouchers of an SIE file): 20
+    // shown, and the lines of the file in @tmp that hold the rest
     {
         std::string sie;
-        for (int i = 1; i <= 2000; ++i) sie += "#VER A " + std::to_string(i) + " 20260101 \"Voucher\"\n{\n}\n";
+        for (int i = 1; i <= 50; ++i) sie += "#VER A " + std::to_string(i) + " 20260101 \"Voucher\"\n{\n}\n";
         Tree::write(t.root / "proj" / "books.se", sie);
         r = run(tools, "find_files", json{{"filename", "books.se"}, {"search_string", "#VER"}});
-        CHECK(contains(r, "@tmp/find_files"));
-        CHECK(!contains(r, "Stopped at"));
-        std::string saved;
-        for (const auto& e : fs::directory_iterator(t.root / "tmp")) {
-            std::ifstream in(e.path(), std::ios::binary);
-            saved.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        }
-        CHECK(contains(saved, "#VER A 1 "));
-        CHECK(contains(saved, "#VER A 1000 "));
-        CHECK(contains(saved, "#VER A 2000 "));
-        fs::remove_all(t.root / "tmp");
-        fs::create_directories(t.root / "tmp");
+        CHECK(contains(r, "  58: #VER A 20 "));
+        CHECK(!contains(r, "#VER A 21 "));
+        CHECK(contains(r, "[30 more matches in this file: lines 24-53 of @tmp/find_files"));
+        const auto saved = saved_lines();
+        CHECK(contains(saved[24], "  61: #VER A 21 "));
+        CHECK(contains(saved[53], "  148: #VER A 50 "));
         fs::remove(t.root / "proj" / "books.se");
     }
 
