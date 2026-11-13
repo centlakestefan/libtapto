@@ -493,7 +493,7 @@ std::string execute_text_editor(const PathRules& rules, Buffers* buffers, const 
 // Content search goes through find_matching_lines (tapto/fstools.h), which
 // streams the file so it can reach files far larger than the context window.
 
-std::string execute_find_files(const PathRules& rules, const json& in) {
+std::string execute_find_files(const PathRules& rules, const json& in, TempFolder& temp) {
     try {
         if (!in.contains("filename")) return "ERROR: 'filename' not present.";
         std::string pattern = in["filename"].get<std::string>();
@@ -513,10 +513,12 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
         std::error_code ec;
         if (!fs::exists(base, ec)) return "ERROR: Path not found: " + start;
 
-        // Every match, not a sample: a result too long for the conversation
-        // goes to @tmp whole (the overflow in editor_tools), where the model
-        // reads or searches it. Only a search that would fill the disk stops,
-        // and says so.
+        // Shown: up to kShownLines matching lines of a file and kShownFiles
+        // files. Found: every match, up to a stop only a search that would
+        // fill the disk reaches. When more is found than shown, all of it goes
+        // to @tmp, and a note at each cut names the lines that hold the rest.
+        constexpr size_t kShownFiles = 100;
+        constexpr size_t kShownLines = 20;
         constexpr size_t kMaxFiles = 100000;
         constexpr size_t kMaxLines = 100000;
         // A matching line is shown up to this many bytes: a minified or
@@ -598,21 +600,74 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
             return "No files matching '" + pattern + "'";
         }
 
+        std::string stop;
+        if (more) {
+            stop = results.size() >= kMaxFiles
+                       ? "[Stopped at " + std::to_string(kMaxFiles) + " files; there are more. Narrow the pattern or the path.]"
+                       : "[Stopped at " + std::to_string(kMaxLines) + " matching lines; there are more. Narrow the search.]";
+        }
+
+        // All of it, as the file in @tmp holds it, and the line (1-based) in
+        // it of each file's name and of its first match.
+        std::string full;
+        std::vector<size_t> name_line(results.size()), match_line(results.size());
+        size_t line_no = 1;
+        const auto add = [&](const std::string& line) {
+            full += line;
+            full += '\n';
+            ++line_no;
+        };
+        add("Found " + std::to_string(results.size()) + " file(s):");
+        add("");
+        bool cut = results.size() > kShownFiles;
+        for (size_t i = 0; i < results.size(); ++i) {
+            const Match& m = results[i];
+            name_line[i] = line_no;
+            add(m.path);
+            match_line[i] = line_no;
+            for (const auto& line : m.lines) add("  " + std::to_string(line.first) + ": " + line.second);
+            if (!m.lines.empty()) add("");
+            if (m.lines.size() > kShownLines) cut = true;
+        }
+        if (more) add(stop);
+        if (!cut) return full;
+
+        std::string error;
+        const std::string where = temp.write(full, "find_files.txt", error);
+        const auto lines_of = [&](size_t first, size_t last) {
+            return "lines " + std::to_string(first) + "-" + std::to_string(last) + " of " + where;
+        };
+
         std::ostringstream out;
-        out << "Found " << results.size() << " file(s):\n\n";
-        for (const auto& m : results) {
+        out << "Found " << results.size() << " file(s)";
+        if (results.size() > kShownFiles) out << ", the first " << kShownFiles << " shown";
+        out << ":\n";
+        if (!where.empty())
+            out << "[All of it is in " << where
+                << ", read-only: view the lines a note names with view_range, or search it.]\n";
+        else
+            out << "[Not all is shown, and the rest could not be kept (" << error << "); narrow the search.]\n";
+        out << "\n";
+        const size_t shown_files = (std::min)(results.size(), kShownFiles);
+        for (size_t i = 0; i < shown_files; ++i) {
+            const Match& m = results[i];
             out << m.path << "\n";
-            for (const auto& line : m.lines) {
-                out << "  " << line.first << ": " << line.second << "\n";
+            for (size_t j = 0; j < m.lines.size() && j < kShownLines; ++j)
+                out << "  " << m.lines[j].first << ": " << m.lines[j].second << "\n";
+            if (m.lines.size() > kShownLines) {
+                out << "  [" << m.lines.size() - kShownLines << " more matches in this file";
+                if (!where.empty())
+                    out << ": " << lines_of(match_line[i] + kShownLines, match_line[i] + m.lines.size() - 1);
+                out << "]\n";
             }
             if (!m.lines.empty()) out << "\n";
         }
-        if (more) {
-            if (results.size() >= kMaxFiles)
-                out << "[Stopped at " << kMaxFiles << " files; there are more. Narrow the pattern or the path.]\n";
-            else
-                out << "[Stopped at " << kMaxLines << " matching lines; there are more. Narrow the search.]\n";
+        if (results.size() > kShownFiles) {
+            out << "[" << results.size() - kShownFiles << " more files";
+            if (!where.empty()) out << ": " << lines_of(name_line[kShownFiles], line_no - 1);
+            out << "]\n";
         }
+        if (more) out << stop << "\n";
         return out.str();
     } catch (const std::exception& e) {
         return std::string("ERROR: find_files failed: ") + e.what();
@@ -764,8 +819,9 @@ std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buf
     find.description =
         "Find files under a directory by filename pattern, optionally grepping their contents. "
         "Supports wildcards: * (any sequence) and ? (single character). "
-        "Returns every match (each line up to 300 bytes); a result too long to show "
-        "is saved whole to a file, whose start and end are shown with its path.";
+        "Shows up to 20 matching lines per file and 100 files (each line up to 300 bytes); "
+        "when there are more, all of them are saved to a file and a note at each cut "
+        "names the lines of that file that hold the rest.";
     find.parameters = {
         {"type", "object"},
         {"properties", {
@@ -776,7 +832,8 @@ std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buf
         {"required", {"filename"}},
     };
     find.executor = [rules, temp](Context&, const json& in) {
-        return (temp ? *temp : default_temp_folder()).overflow(execute_find_files(rules, in), "find_files");
+        TempFolder& folder = temp ? *temp : default_temp_folder();
+        return folder.overflow(execute_find_files(rules, in, folder), "find_files");
     };
     find.display = display_find_files;
     tools.push_back(std::move(find));
