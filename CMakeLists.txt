@@ -139,6 +139,7 @@ add_library(tapto STATIC
   src/chat_commands.cpp
   src/certs.cpp
   src/tool_image.cpp
+  src/stream.cpp
 )
 add_library(tapto::tapto ALIAS tapto)
 

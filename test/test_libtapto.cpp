@@ -1302,6 +1302,302 @@ void test_user_agent_sent() {
     listener.join();
 }
 
+// --- streaming ----------------------------------------------------------------
+
+// The event-stream framing, fed in every split a network could make of it.
+void test_sse_parser() {
+    const std::string body =
+        "\xEF\xBB\xBF: keep-alive\r\n"
+        "\r\n"
+        "data: {\"a\":1}\r\n"
+        "\r\n"
+        "event: error\n"
+        "data: line one\n"
+        "data:line two\n"
+        "id: 7\n"
+        "\n"
+        "event: nothing\n"
+        "\n"
+        "data: \xC3\xA5\xC3\xA4\r"
+        "\r"
+        "data: [DONE]"; // no blank line before the end
+
+    const std::vector<tapto::SseEvent> expected = {
+        {"", "{\"a\":1}"},
+        {"error", "line one\nline two"},
+        {"", "\xC3\xA5\xC3\xA4"},
+        {"", "[DONE]"},
+    };
+
+    for (std::size_t piece = 1; piece <= body.size(); ++piece) {
+        tapto::SseParser parser;
+        std::vector<tapto::SseEvent> got;
+        auto on = [&](const tapto::SseEvent& ev) { got.push_back(ev); };
+        for (std::size_t at = 0; at < body.size(); at += piece) {
+            parser.feed(body.data() + at, (std::min)(piece, body.size() - at), on);
+        }
+        parser.finish(on);
+        CHECK_EQ(got.size(), expected.size());
+        if (got.size() != expected.size()) continue;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            CHECK_EQ(got[i].event, expected[i].event);
+            CHECK_EQ(got[i].data, expected[i].data);
+        }
+    }
+
+    // A CRLF split between two pieces is one line end, not two.
+    {
+        tapto::SseParser parser;
+        std::vector<tapto::SseEvent> got;
+        auto on = [&](const tapto::SseEvent& ev) { got.push_back(ev); };
+        parser.feed("data: a\r", 8, on);
+        parser.feed("\ndata: b\r\n\r\n", 12, on);
+        CHECK_EQ(got.size(), std::size_t(1));
+        if (got.size() == 1) CHECK_EQ(got[0].data, std::string("a\nb"));
+    }
+}
+
+// openai chunks back into the reply the non-streaming endpoint sends.
+void test_openai_stream_accumulator() {
+    auto chunk = [](json delta, json finish = nullptr) {
+        return json{{"id", "c1"}, {"model", "m"},
+                    {"choices", json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}};
+    };
+
+    // Reasoning, text, and two tool calls in pieces, matched up by index.
+    {
+        tapto::OpenAIStreamAccumulator acc;
+        CHECK(!acc.started());
+        auto d = acc.add(chunk({{"role", "assistant"}, {"reasoning_content", "Let me "}}));
+        CHECK_EQ(d.reasoning, std::string("Let me "));
+        acc.add(chunk({{"reasoning", "look."}}));
+        d = acc.add(chunk({{"content", "Reading."}}));
+        CHECK_EQ(d.text, std::string("Reading."));
+        acc.add(chunk({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"}, {"type", "function"},
+                                                     {"function", {{"name", "read"}, {"arguments", ""}}}}})}}));
+        acc.add(chunk({{"tool_calls", json::array({{{"index", 1}, {"id", "t1"},
+                                                     {"function", {{"name", "list"}, {"arguments", "{}"}}}}})}}));
+        acc.add(chunk({{"tool_calls", json::array({{{"index", 0}, {"function", {{"arguments", "{\"path\":"}}}}})}}));
+        // a server that repeats the id and name in every piece
+        acc.add(chunk({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"},
+                                                     {"function", {{"name", "read"}, {"arguments", "\"a\"}"}}}}})}}));
+        acc.add(chunk(json::object(), "tool_calls"));
+        acc.add({{"id", "c1"}, {"choices", json::array()},
+                 {"usage", {{"prompt_tokens", 10}, {"completion_tokens", 5}}}});
+        CHECK(acc.started());
+
+        const json resp = acc.response();
+        const json& msg = resp["choices"][0]["message"];
+        CHECK_EQ(msg["content"].get<std::string>(), std::string("Reading."));
+        CHECK_EQ(msg["reasoning_content"].get<std::string>(), std::string("Let me look."));
+        CHECK_EQ(msg["tool_calls"].size(), std::size_t(2));
+        CHECK_EQ(msg["tool_calls"][0]["id"].get<std::string>(), std::string("t0"));
+        CHECK_EQ(msg["tool_calls"][0]["function"]["name"].get<std::string>(), std::string("read"));
+        CHECK_EQ(msg["tool_calls"][0]["function"]["arguments"].get<std::string>(), std::string("{\"path\":\"a\"}"));
+        CHECK_EQ(msg["tool_calls"][1]["function"]["arguments"].get<std::string>(), std::string("{}"));
+        CHECK_EQ(resp["choices"][0]["finish_reason"].get<std::string>(), std::string("tool_calls"));
+        CHECK_EQ(resp["usage"]["prompt_tokens"].get<int>(), 10);
+
+        // interrupted: no half-received calls, and no finish reason made up over the server's
+        const json cut = acc.response(true);
+        CHECK(!cut["choices"][0]["message"].contains("tool_calls"));
+        CHECK_EQ(cut["choices"][0]["message"]["content"].get<std::string>(), std::string("Reading."));
+    }
+
+    // No index: a call goes on until a piece brings a new id. No id: one is made.
+    {
+        tapto::OpenAIStreamAccumulator acc;
+        acc.add(chunk({{"tool_calls", json::array({{{"function", {{"name", "a"}, {"arguments", "{\"x\""}}}}})}}));
+        acc.add(chunk({{"tool_calls", json::array({{{"function", {{"arguments", ":1}"}}}}})}}));
+        acc.add(chunk({{"tool_calls", json::array({{{"id", "b1"}, {"function", {{"name", "b"}, {"arguments", {{"y", 2}}}}}}})}}));
+        const json msg = acc.response()["choices"][0]["message"];
+        CHECK(msg["content"].is_null());
+        CHECK_EQ(msg["tool_calls"].size(), std::size_t(2));
+        CHECK_EQ(msg["tool_calls"][0]["id"].get<std::string>(), std::string("call_0"));
+        CHECK_EQ(msg["tool_calls"][0]["function"]["arguments"].get<std::string>(), std::string("{\"x\":1}"));
+        CHECK_EQ(msg["tool_calls"][1]["function"]["arguments"].get<std::string>(), std::string("{\"y\":2}"));
+        CHECK_EQ(acc.response()["choices"][0]["finish_reason"].get<std::string>(), std::string("tool_calls"));
+    }
+
+    // An interrupted reply with nothing finished says so.
+    {
+        tapto::OpenAIStreamAccumulator acc;
+        acc.add(chunk({{"content", "Hal"}}));
+        CHECK_EQ(acc.response(true)["choices"][0]["finish_reason"].get<std::string>(), std::string("interrupted"));
+        CHECK_EQ(acc.response()["choices"][0]["finish_reason"].get<std::string>(), std::string("stop"));
+    }
+
+    // An error after the 200.
+    {
+        tapto::OpenAIStreamAccumulator acc;
+        bool threw = false;
+        try {
+            acc.add({{"error", {{"message", "overloaded"}}}});
+        } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()).find("overloaded") != std::string::npos;
+        }
+        CHECK(threw);
+    }
+}
+
+// A whole streamed turn against a local server: a tool round, then the
+// answer, shown as it arrives and returned whole, with the usage reported.
+void test_openai_streamed_chat() {
+    httplib::Server server;
+    std::vector<json> requests;
+    bool wholeReply = false; // answer as if `stream` were not understood
+
+    auto sse = [](const std::vector<json>& chunks) {
+        std::string body;
+        for (const auto& c : chunks) body += "data: " + c.dump() + "\n\n";
+        body += ": a keep-alive\n\ndata: [DONE]\n\n";
+        return body;
+    };
+    auto delta = [](json d, json finish = nullptr) {
+        return json{{"choices", json::array({{{"index", 0}, {"delta", d}, {"finish_reason", finish}}})}};
+    };
+
+    server.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        requests.push_back(json::parse(req.body));
+        if (wholeReply) {
+            json reply = {{"choices", json::array({{{"message", {{"role", "assistant"}, {"content", "whole"}}},
+                                                    {"finish_reason", "stop"}}})},
+                          {"usage", {{"prompt_tokens", 1}, {"completion_tokens", 1}}}};
+            res.set_content(reply.dump(), "application/json");
+            return;
+        }
+        std::string body;
+        if (requests.size() == 1) {
+            body = sse({
+                delta({{"role", "assistant"}, {"reasoning_content", "Need "}}),
+                delta({{"reasoning_content", "the tool."}}),
+                delta({{"tool_calls", json::array({{{"index", 0}, {"id", "t0"}, {"type", "function"},
+                                                    {"function", {{"name", "echo"}, {"arguments", "{\"s\":"}}}}})}}),
+                delta({{"tool_calls", json::array({{{"index", 0}, {"function", {{"arguments", "\"hi\"}"}}}}})}}),
+                delta(json::object(), "tool_calls"),
+                {{"choices", json::array()}, {"usage", {{"prompt_tokens", 7}, {"completion_tokens", 3}}}},
+            });
+        } else {
+            body = sse({
+                delta({{"content", "Done: "}}),
+                delta({{"content", "hi"}}, "stop"),
+                {{"choices", json::array()}, {"usage", {{"prompt_tokens", 9}, {"completion_tokens", 2}}}},
+            });
+        }
+        // Sent in small pieces, so the reply is put back together across reads.
+        res.set_chunked_content_provider("text/event-stream", [body](size_t, httplib::DataSink& sink) {
+            for (std::size_t at = 0; at < body.size(); at += 13) {
+                sink.write(body.data() + at, (std::min<std::size_t>)(13, body.size() - at));
+            }
+            sink.done();
+            return true;
+        });
+    });
+    const int port = server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    if (port <= 0) return;
+    std::thread listener([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+
+    AiConfig cfg;
+    cfg.setStream(true);
+    std::string shown;
+    cfg.setStreamCallback([&](const tapto::StreamEvent& ev) {
+        switch (ev.kind) {
+        case tapto::StreamEvent::Kind::Reasoning: shown += "[r]" + ev.text; break;
+        case tapto::StreamEvent::Kind::Text: shown += "[t]" + ev.text; break;
+        case tapto::StreamEvent::Kind::End: shown += "[end]"; break;
+        }
+    });
+    std::vector<tapto::TokenUsage> told;
+    cfg.setUsageCallback([&](const tapto::TokenUsage& u) { told.push_back(u); });
+
+    ToolSpec echo;
+    echo.name = "echo";
+    echo.description = "echo";
+    std::string echoed;
+    echo.executor = [&](Context&, const json& in) {
+        echoed = in.value("s", std::string());
+        return echoed;
+    };
+
+    OpenAIClient client(&cfg, url, "m", "k");
+    client.start();
+    Context ctx;
+    ctx.tools.push_back(echo);
+    std::string reply;
+    try {
+        reply = client.chat(ctx, "say hi");
+    } catch (const std::exception& e) {
+        std::cerr << "streamed chat: " << e.what() << "\n";
+        CHECK(false);
+    }
+
+    CHECK_EQ(reply, std::string("Done: hi"));
+    CHECK_EQ(echoed, std::string("hi"));
+    CHECK_EQ(shown, std::string("[r]Need [r]the tool.[end][t]Done: [t]hi[end]"));
+    CHECK_EQ(requests.size(), std::size_t(2));
+    if (!requests.empty()) {
+        CHECK(requests[0].value("stream", false));
+        CHECK(requests[0]["stream_options"].value("include_usage", false));
+    }
+    CHECK_EQ(told.size(), std::size_t(2));
+    if (told.size() == 2) {
+        CHECK_EQ(told[0].input, std::uint64_t(7));
+        CHECK_EQ(told[1].output, std::uint64_t(2));
+    }
+    // The history holds the call whole, as the next request sends it.
+    const json history = client.getHistory();
+    CHECK(history.size() >= 2);
+    if (history.size() >= 2) {
+        CHECK_EQ(history[1]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
+                 std::string("{\"s\":\"hi\"}"));
+        CHECK(!history[1].contains("reasoning_content"));
+    }
+
+    // A server that answers whole although asked for a stream: shown whole.
+    wholeReply = true;
+    shown.clear();
+    client.start();
+    try {
+        reply = client.chat(ctx, "again");
+    } catch (const std::exception& e) {
+        std::cerr << "whole reply: " << e.what() << "\n";
+        CHECK(false);
+    }
+    CHECK_EQ(reply, std::string("whole"));
+    CHECK_EQ(shown, std::string("[t]whole[end]"));
+
+    // ESC while a tool call streams in: the call is not run, the turn ends
+    // without an error, and nothing in the history asks for an answer.
+    wholeReply = false;
+    requests.clear();
+    echoed.clear();
+    shown.clear();
+    client.start();
+    CancellationToken cancel;
+    cancel.setCheckFn([] { return true; });
+    Context stopped;
+    stopped.tools.push_back(echo);
+    stopped.cancel = &cancel;
+    try {
+        client.chat(stopped, "say hi");
+    } catch (const std::exception& e) {
+        std::cerr << "stopped stream: " << e.what() << "\n";
+        CHECK(false);
+    }
+    CHECK(echoed.empty());
+    CHECK_EQ(requests.size(), std::size_t(1));
+    for (const auto& m : client.getHistory()) {
+        CHECK(!m.contains("tool_calls"));
+    }
+    CHECK(shown.empty() || (shown.size() >= 5 && shown.compare(shown.size() - 5, 5, "[end]") == 0));
+
+    server.stop();
+    listener.join();
+}
+
 } // namespace
 
 // The editor in a program without a working directory (tapto-word): a path
@@ -1706,6 +2002,9 @@ int main() {
     test_certificates();
     test_usage_from();
     test_user_agent_sent();
+    test_sse_parser();
+    test_openai_stream_accumulator();
+    test_openai_streamed_chat();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) failed\n";
