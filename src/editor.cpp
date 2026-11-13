@@ -4,6 +4,7 @@
 #include "tapto/editor.h"
 
 #include "tapto/context.h"
+#include "tapto/overflow.h"
 #include "tapto/program.h"
 
 #include <algorithm>
@@ -514,6 +515,9 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
 
         constexpr size_t kMaxFiles = 100;
         constexpr size_t kMaxLinesPerFile = 20;
+        // A matching line is shown up to this many bytes: a minified or
+        // one-line file must not put megabytes into one result.
+        constexpr size_t kMaxLineBytes = 300;
 
         struct Match {
             std::string path;
@@ -521,8 +525,9 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
         };
         std::vector<Match> results;
 
+        bool more = false; // stopped at kMaxFiles with files left to look at
         fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec), end;
-        for (; it != end && results.size() < kMaxFiles; it.increment(ec)) {
+        for (; it != end; it.increment(ec)) {
             if (ec) break;
             const fs::path& p = it->path();
             // Never follow symlinks — they could point outside the sandbox.
@@ -535,6 +540,12 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
             }
             if (!it->is_regular_file(ec)) continue;
             if (!wildcard_match(pattern, p.filename().string())) continue;
+            if (results.size() >= kMaxFiles) {
+                // a further match: only to say there are more (for a content
+                // search, a name match whose content may not match; close enough)
+                more = true;
+                break;
+            }
 
             Match m;
             // Report paths relative to the sandbox root so they match how the
@@ -553,7 +564,16 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
                 // on binaries, and we keep at most kMaxLinesPerFile hits per file.
                 auto lines = find_matching_lines(p, query, kMaxLinesPerFile);
                 if (lines.empty()) continue;   // file name matched, content didn't
-                for (const auto& lm : lines) m.lines.emplace_back(lm.line, std::move(lm.text));
+                for (const auto& lm : lines) {
+                    std::string text = lm.text;
+                    if (text.size() > kMaxLineBytes) {
+                        // back to the start of a UTF-8 character
+                        std::size_t n = kMaxLineBytes;
+                        while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0) == 0x80) --n;
+                        text = text.substr(0, n) + "\xE2\x80\xA6 (" + std::to_string(lm.text.size()) + " bytes)";
+                    }
+                    m.lines.emplace_back(lm.line, std::move(text));
+                }
             }
 
             results.push_back(std::move(m));
@@ -575,6 +595,8 @@ std::string execute_find_files(const PathRules& rules, const json& in) {
             }
             if (!m.lines.empty()) out << "\n";
         }
+        if (more)
+            out << "[Stopped at " << kMaxFiles << " files; there are more. Narrow the pattern or the path.]\n";
         return out.str();
     } catch (const std::exception& e) {
         return std::string("ERROR: find_files failed: ") + e.what();
@@ -657,7 +679,7 @@ std::string display_find_files(const json& input) {
 
 } // namespace
 
-std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buffers> buffers) {
+std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buffers> buffers, TempFolder* temp) {
     std::vector<ToolSpec> tools;
     const PathRules rules(folders);
 
@@ -735,7 +757,9 @@ std::vector<ToolSpec> editor_tools(const FolderSet& folders, std::shared_ptr<Buf
         }},
         {"required", {"filename"}},
     };
-    find.executor = [rules](Context&, const json& in) { return execute_find_files(rules, in); };
+    find.executor = [rules, temp](Context&, const json& in) {
+        return (temp ? *temp : default_temp_folder()).overflow(execute_find_files(rules, in), "find_files");
+    };
     find.display = display_find_files;
     tools.push_back(std::move(find));
 
