@@ -217,6 +217,15 @@ bool PathRules::resolve(const std::string& input, fs::path& out, std::string& er
     if (ec) resolved = abs.lexically_normal();
 
     if (resolved == root || is_under(root, resolved)) {
+        // The working directory can be read-only too (a program that hands
+        // its agent a repository to read): a write under it is refused
+        // however it is spelled -- relative, absolute, or through "..". The
+        // deepest folder decides, so a writable grant inside it stays
+        // writable.
+        if (writes) {
+            if (const Folder* f = owner(resolved, /*writable_only=*/false); f && !f->writable)
+                return refuse_read_only(*f);
+        }
         out = resolved;
         return true;
     }
