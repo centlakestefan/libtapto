@@ -764,7 +764,7 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
     // answer them so the conversation stays valid on the next turn.
     if (message.contains("tool_calls") && !message["tool_calls"].empty()) {
         std::string reason = user_cancelled
-            ? "Tool not run: interrupted by user."
+            ? "Tool not run: the turn was stopped before it ran (interrupted, or ended by an earlier call)."
             : "Tool not run: iteration limit reached.";
         for (const auto& tc : message["tool_calls"]) {
             m_conversation_history.push_back({

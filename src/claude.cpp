@@ -605,7 +605,7 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
     if (has_tool_use(response)) {
         json tool_results = json::array();
         std::string reason = user_cancelled
-            ? "Tool not run: interrupted by user."
+            ? "Tool not run: the turn was stopped before it ran (interrupted, or ended by an earlier call)."
             : "Tool not run: iteration limit reached.";
         for (const auto& block : response["content"]) {
             if (block.value("type", std::string()) == "tool_use") {

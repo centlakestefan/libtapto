@@ -559,7 +559,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
                     {"functionResponse", {
                         {"name", part["functionCall"].value("name", std::string())},
                         {"response", {{"content", user_cancelled
-                            ? "Tool not run: interrupted by user."
+                            ? "Tool not run: the turn was stopped before it ran (interrupted, or ended by an earlier call)."
                             : "Tool not run: iteration limit reached."}}}
                     }}
                 });
