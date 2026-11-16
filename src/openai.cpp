@@ -101,10 +101,28 @@ std::string extractContent(const json& message) {
 /// <summary>Strip per-turn-only fields from an assistant message before
 /// echoing it back to the server in conversation history. `reasoning_content`
 /// is chain-of-thought scratch that some providers (DeepSeek's hosted API)
-/// reject when sent back, and all providers waste tokens reading it.</summary>
+/// reject when sent back, and all providers waste tokens reading it.
+/// A tool call whose arguments are not a JSON object (a reply cut off at the
+/// output limit partway through them) is sent back with `{}`: llama.cpp
+/// parses every call's arguments in the history to render its chat template
+/// and refuses the whole request otherwise (HTTP 500, "Failed to parse tool
+/// call arguments as JSON"), every retry alike. The tool result says what
+/// went wrong.</summary>
 json historyMessage(json message) {
     for (const char* field : kReasoningFields) {
         message.erase(field);
+    }
+    if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
+        for (json& call : message["tool_calls"]) {
+            if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
+            json& fn = call["function"];
+            bool ok = false;
+            if (fn.contains("arguments") && fn["arguments"].is_string()) {
+                const json parsed = json::parse(fn["arguments"].get<std::string>(), nullptr, false);
+                ok = !parsed.is_discarded() && parsed.is_object();
+            }
+            if (!ok) fn["arguments"] = "{}";
+        }
     }
     return message;
 }
@@ -617,9 +635,31 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
                 catch (...) {
                     raw_args = tool_call["function"]["arguments"].dump();
                 }
-                result = "ERROR: Tool call arguments are not valid JSON: " + std::string(e.what()) +
-                        "\nReceived arguments: " + raw_args +
-                        "\nPlease retry this tool call with a valid JSON object as the arguments.";
+                // The start of them only: a call cut off at the output limit
+                // carries a whole file's worth, which would fill the context.
+                constexpr std::size_t kShownArgs = 1000;
+                std::string shown_args = raw_args;
+                if (shown_args.size() > kShownArgs) {
+                    std::size_t cut = kShownArgs;
+                    while (cut > 0 && (static_cast<unsigned char>(shown_args[cut]) & 0xC0) == 0x80) --cut;
+                    shown_args = shown_args.substr(0, cut) + "... (" + std::to_string(raw_args.size()) +
+                                 " characters in all)";
+                }
+                const bool cut_off = choice.value("finish_reason", std::string()) == "length";
+                // the parser's message quotes the last token read: the whole cut-off string
+                std::string why = e.what();
+                if (why.size() > 300) {
+                    std::size_t at = 300;
+                    while (at > 0 && (static_cast<unsigned char>(why[at]) & 0xC0) == 0x80) --at;
+                    why = why.substr(0, at) + "...";
+                }
+                result = "ERROR: Tool call arguments are not valid JSON: " + why +
+                        "\nReceived arguments: " + shown_args +
+                        (cut_off ? "\nYour reply reached the output limit (max output tokens) in the middle of "
+                                   "this call, so its arguments were cut off and it did not run. Make the call "
+                                   "smaller: write a large file in parts, creating it with the first part and "
+                                   "adding the rest with further edits."
+                                 : "\nPlease retry this tool call with a valid JSON object as the arguments.");
                 mclog("Tool argument parse failure for '" + tool_name + "': " + e.what() + "\n");
             }
 

@@ -1443,6 +1443,84 @@ void test_openai_stream_accumulator() {
 
 // A whole streamed turn against a local server: a tool round, then the
 // answer, shown as it arrives and returned whole, with the usage reported.
+// A reply cut off at the output limit partway through a tool call's
+// arguments: the next request sends the call back with `{}` (llama.cpp
+// refuses a history holding invalid arguments, every retry alike), and the
+// tool result says it was cut off, with only the start of what came.
+void test_openai_cut_off_tool_call() {
+    httplib::Server server;
+    std::vector<json> requests;
+    const std::string cut = "{\"command\":\"create\",\"path\":\"plans/a.md\",\"file_text\":\"" +
+                            std::string(3000, 'x');
+    server.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        requests.push_back(json::parse(req.body));
+        json message = {{"role", "assistant"}, {"content", "Done."}};
+        std::string finish = "stop";
+        if (requests.size() == 1) {
+            message = {{"role", "assistant"},
+                       {"content", nullptr},
+                       {"tool_calls", json::array({{{"id", "t0"},
+                                                    {"type", "function"},
+                                                    {"function", {{"name", "echo"}, {"arguments", cut}}}}})}};
+            finish = "length";
+        }
+        res.set_content(json{{"choices", json::array({{{"message", message}, {"finish_reason", finish}}})},
+                             {"usage", {{"prompt_tokens", 1}, {"completion_tokens", 1}}}}
+                            .dump(),
+                        "application/json");
+    });
+    const int port = server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    if (port <= 0) return;
+    std::thread listener([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+
+    AiConfig cfg;
+    ToolSpec echo;
+    echo.name = "echo";
+    echo.description = "echo";
+    bool ran = false;
+    echo.executor = [&](Context&, const json&) {
+        ran = true;
+        return std::string("ran");
+    };
+    OpenAIClient client(&cfg, "http://127.0.0.1:" + std::to_string(port), "m", "k");
+    client.start();
+    Context ctx;
+    ctx.tools.push_back(echo);
+    std::string reply;
+    try {
+        reply = client.chat(ctx, "write the plan");
+    } catch (const std::exception& e) {
+        std::cerr << "cut-off tool call: " << e.what() << "\n";
+        CHECK(false);
+    }
+    CHECK_EQ(reply, std::string("Done."));
+    CHECK(!ran);
+    CHECK_EQ(requests.size(), std::size_t(2));
+    if (requests.size() == 2) {
+        const json& msgs = requests[1]["messages"];
+        bool call_sent = false, result_sent = false;
+        for (const json& m : msgs) {
+            if (m.value("role", "") == "assistant" && m.contains("tool_calls")) {
+                call_sent = true;
+                CHECK_EQ(m["tool_calls"][0]["function"]["arguments"].get<std::string>(), std::string("{}"));
+            }
+            if (m.value("role", "") == "tool") {
+                result_sent = true;
+                const std::string text = m.value("content", "");
+                CHECK(text.find("reached the output limit") != std::string::npos);
+                CHECK(text.find("characters in all)") != std::string::npos);
+                CHECK(text.size() < 2000);
+            }
+        }
+        CHECK(call_sent);
+        CHECK(result_sent);
+    }
+    server.stop();
+    listener.join();
+}
+
 void test_openai_streamed_chat() {
     httplib::Server server;
     std::vector<json> requests;
@@ -2434,6 +2512,7 @@ int main() {
     test_user_agent_sent();
     test_sse_parser();
     test_openai_stream_accumulator();
+    test_openai_cut_off_tool_call();
     test_openai_streamed_chat();
     test_claude_stream_accumulator();
     test_gemini_stream_accumulator();
