@@ -1977,6 +1977,40 @@ void test_editor_without_home() {
     tapto::set_program_name("tapto");
 }
 
+// A read-only working directory refuses a write however the path is written:
+// by its label, relative, absolute, or through "..". It once refused only the
+// label, and an agent wrote a repository it was handed to read by its
+// absolute path. A writable grant beside it stays writable, whichever way
+// it is reached.
+void test_editor_read_only_home() {
+    Tree t("editor-ro-home");
+    fs::create_directories(t.root / "proj" / "src");
+    fs::create_directories(t.root / "scratch");
+    tapto::FolderSet set;
+    CHECK_EQ(set.set_home((t.root / "proj").string(), /*writable=*/false), std::string());
+    CHECK_EQ(set.add((t.root / "scratch").string(), nullptr, /*writable=*/true), std::string());
+    const auto tools = tapto::editor_tools(set);
+    auto create = [&](const std::string& path) {
+        return run(tools, "str_replace_based_edit_tool",
+                   json{{"command", "create"}, {"path", path}, {"file_text", "x\n"}});
+    };
+    const std::string abs = (t.root / "proj").generic_string();
+    for (const std::string& p : {std::string("proj/src/a.txt"), std::string("src/a.txt"),
+                                 abs + "/src/a.txt", abs + "/../scratch/../proj/src/a.txt"}) {
+        const std::string r = create(p);
+        CHECK(starts_with(r, "ERROR:") && contains(r, "read-only"));
+    }
+    CHECK(!fs::exists(t.root / "proj" / "src" / "a.txt"));
+    CHECK(!starts_with(create("scratch/b.txt"), "ERROR:"));
+    CHECK(!starts_with(create(abs + "/../scratch/c.txt"), "ERROR:"));
+    CHECK(fs::exists(t.root / "scratch" / "b.txt") && fs::exists(t.root / "scratch" / "c.txt"));
+    // reading the working directory is as before
+    Tree::write(t.root / "proj" / "src" / "r.txt", "r\n");
+    CHECK(!starts_with(run(tools, "str_replace_based_edit_tool",
+                           json{{"command", "view"}, {"path", abs + "/src/r.txt"}}),
+                       "ERROR:"));
+}
+
 // find_files within bounds: a long matching line shown only in part, a
 // stop at 100 files said, and a result too long for the context in the
 // session's @tmp with its head and tail inline.
@@ -2391,6 +2425,7 @@ int main() {
     test_folder_tools();
     test_editor_without_home();
     test_editor_buffers();
+    test_editor_read_only_home();
     test_find_files_bounds();
     test_command_tools();
     test_program_keys_and_commands();
