@@ -263,7 +263,7 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
 
             // Part of the reply is already on the user's screen. Asking again
             // would show it a second time, and as a different reply.
-            if (streamed.shown) {
+            if (streamed.shown && !m_config->retryLostReply()) {
                 mclog("Connection lost partway through a streamed reply: " + error_msg + "\n");
                 throw std::runtime_error("The connection was lost partway through the reply: " + error_msg);
             }

@@ -28,6 +28,7 @@ public:
     const tapto::RetryCallback& retryCallback() const { return m_retryCallback; }
     bool stream() const { return m_stream; }
     const tapto::StreamCallback& streamCallback() const { return m_streamCallback; }
+    bool retryLostReply() const { return m_retryLostReply; }
     // Whether the pieces of a reply reach the program as they arrive, so the
     // clients do not show them again through ui::emit_intermediate.
     bool showsStream() const { return m_stream && static_cast<bool>(m_streamCallback); }
@@ -47,6 +48,7 @@ public:
     void setRetryCallback(tapto::RetryCallback v) { m_retryCallback = std::move(v); }
     void setStream(bool v) { m_stream = v; }
     void setStreamCallback(tapto::StreamCallback v) { m_streamCallback = std::move(v); }
+    void setRetryLostReply(bool v) { m_retryLostReply = v; }
 
 private:
     int m_maxOutputTokens = 16000;
@@ -116,4 +118,12 @@ private:
     // whole reply, which the program has then already shown. Empty: nothing
     // is shown until the reply is complete, as without streaming.
     tapto::StreamCallback m_streamCallback;
+
+    // A streamed reply lost partway through (the connection dropped, the
+    // server restarted, an error in the stream after part of it was shown):
+    // asked again like any failed request, the stream callback having been
+    // told its End. Off: thrown, since a person watching would see the
+    // reply a second time, and a different one. A program whose replies
+    // nobody watches as they come (a server's agents) turns it on.
+    bool m_retryLostReply = false;
 };

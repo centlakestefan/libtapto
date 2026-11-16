@@ -1521,6 +1521,69 @@ void test_openai_cut_off_tool_call() {
     listener.join();
 }
 
+// A streamed reply whose connection drops partway through: thrown by
+// default (a person saw part of it), asked again with setRetryLostReply.
+void test_openai_lost_stream_retried() {
+    for (const bool retry : {false, true}) {
+        httplib::Server server;
+        int requests = 0;
+        server.Post("/v1/chat/completions", [&](const httplib::Request&, httplib::Response& res) {
+            ++requests;
+            const bool cut = requests == 1;
+            res.set_chunked_content_provider("text/event-stream", [cut](size_t, httplib::DataSink& sink) {
+                auto put = [&](const json& delta, const json& finish) {
+                    const std::string ev =
+                        "data: " +
+                        json{{"choices", json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}}
+                            .dump() +
+                        "\n\n";
+                    sink.write(ev.data(), ev.size());
+                };
+                put({{"role", "assistant"}, {"content", cut ? "Hal" : "Hello"}}, nullptr);
+                if (cut) return false; // the server goes away
+                put(json::object(), "stop");
+                const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
+                sink.done();
+                return true;
+            });
+        });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        CHECK(port > 0);
+        if (port <= 0) return;
+        std::thread listener([&] { server.listen_after_bind(); });
+        server.wait_until_ready();
+
+        AiConfig cfg;
+        cfg.setStream(true);
+        cfg.setRetryLostReply(retry);
+        std::string shown;
+        cfg.setStreamCallback([&](const tapto::StreamEvent& ev) {
+            if (ev.kind == tapto::StreamEvent::Kind::Text) shown += ev.text;
+            if (ev.kind == tapto::StreamEvent::Kind::End) shown += "|";
+        });
+        OpenAIClient client(&cfg, "http://127.0.0.1:" + std::to_string(port), "m", "k");
+        client.start();
+        Context ctx;
+        std::string reply, error;
+        try {
+            reply = client.chat(ctx, "hi");
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        if (retry) {
+            CHECK_EQ(reply, std::string("Hello"));
+            CHECK_EQ(requests, 2);
+            CHECK_EQ(shown, std::string("Hal|Hello|"));
+        } else {
+            CHECK(error.find("lost partway through the reply") != std::string::npos);
+            CHECK_EQ(requests, 1);
+        }
+        server.stop();
+        listener.join();
+    }
+}
+
 void test_openai_streamed_chat() {
     httplib::Server server;
     std::vector<json> requests;
@@ -2513,6 +2576,7 @@ int main() {
     test_sse_parser();
     test_openai_stream_accumulator();
     test_openai_cut_off_tool_call();
+    test_openai_lost_stream_retried();
     test_openai_streamed_chat();
     test_claude_stream_accumulator();
     test_gemini_stream_accumulator();

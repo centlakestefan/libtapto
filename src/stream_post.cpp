@@ -84,7 +84,7 @@ httplib::Result post_stream(httplib::Client& client, const std::string& path,
               (streamError.empty() ? "" : ", error: " + streamError) + "\n");
 
         if (!streamError.empty()) {
-            if (out.shown) throw std::runtime_error(streamError);
+            if (out.shown && !config.retryLostReply()) throw std::runtime_error(streamError);
             auto retry = std::make_unique<httplib::Response>();
             retry->status = 503;
             retry->body = streamError;
