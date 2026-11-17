@@ -1447,6 +1447,23 @@ void test_openai_stream_accumulator() {
 // arguments: the next request sends the call back with `{}` (llama.cpp
 // refuses a history holding invalid arguments, every retry alike), and the
 // tool result says it was cut off, with only the start of what came.
+// A required argument missing and an unknown one given: named, not run.
+void test_misnamed_arguments() {
+    ToolSpec ed;
+    ed.name = "str_replace_based_edit_tool";
+    ed.parameters = {{"type", "object"},
+                     {"properties", {{"command", {{"type", "string"}}}, {"path", {{"type", "string"}}}}},
+                     {"required", json::array({"command", "path"})}};
+    const std::string wrong =
+        tapto::misnamed_arguments(ed, json{{"command", "view"}, {"file_path", "src/a.go"}});
+    CHECK(wrong.find("needs 'path'") != std::string::npos);
+    CHECK(wrong.find("given 'file_path'") != std::string::npos);
+    CHECK(wrong.find("named 'command', 'path'") != std::string::npos);
+    CHECK(tapto::misnamed_arguments(ed, json{{"command", "view"}, {"path", "a"}}).empty());
+    CHECK(tapto::misnamed_arguments(ed, json{{"command", "view"}}).empty()); // only missing: the executor says
+    CHECK(tapto::misnamed_arguments(ed, json{{"command", "view"}, {"path", "a"}, {"x", 1}}).empty()); // extra only
+}
+
 void test_openai_cut_off_tool_call() {
     httplib::Server server;
     std::vector<json> requests;
@@ -2575,6 +2592,7 @@ int main() {
     test_user_agent_sent();
     test_sse_parser();
     test_openai_stream_accumulator();
+    test_misnamed_arguments();
     test_openai_cut_off_tool_call();
     test_openai_lost_stream_retried();
     test_openai_streamed_chat();

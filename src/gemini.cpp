@@ -337,7 +337,8 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
     // Wrap all tools to bind context
     for (const auto& tool : context.tools) {
         auto executor = tool.executor;
-        m_tool_registry[tool.name] = [executor, &context](const json& input) {
+        m_tool_registry[tool.name] = [executor, spec = tool, &context](const json& input) {
+            if (std::string wrong = tapto::misnamed_arguments(spec, input); !wrong.empty()) return wrong;
             return executor(context, input);
         };
         m_tools.push_back(tool);

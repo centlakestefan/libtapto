@@ -59,6 +59,37 @@ struct ToolSpec {
     ToolDisplayFn display;
 };
 
+namespace tapto {
+
+// A call missing an argument its schema requires while passing one the
+// schema does not have: the model named it wrong ("file_path" for "path").
+// The error says so; the executor's own "'path' not present" was read as
+// "the file is not there", and the agent took the editor for broken. Empty
+// for any other call (the executor decides, as before).
+inline std::string misnamed_arguments(const ToolSpec& spec, const nlohmann::json& in) {
+    const nlohmann::json& p = spec.parameters;
+    if (!in.is_object() || !p.is_object() || !p.contains("required") || !p["required"].is_array()) return "";
+    const nlohmann::json props = p.contains("properties") && p["properties"].is_object() ? p["properties"]
+                                                                                          : nlohmann::json::object();
+    std::vector<std::string> missing, unknown;
+    for (const auto& r : p["required"])
+        if (r.is_string() && !in.contains(r.get<std::string>())) missing.push_back(r.get<std::string>());
+    for (const auto& [k, v] : in.items())
+        if (!props.contains(k)) unknown.push_back(k);
+    if (missing.empty() || unknown.empty()) return "";
+    auto list = [](const std::vector<std::string>& names) {
+        std::string s;
+        for (const auto& n : names) s += (s.empty() ? "'" : ", '") + n + "'";
+        return s;
+    };
+    std::vector<std::string> all;
+    for (const auto& [k, v] : props.items()) all.push_back(k);
+    return "ERROR: " + spec.name + " was not run: it needs " + list(missing) + ", and was given " + list(unknown) +
+           ", which it does not take. Its arguments are named " + list(all) + ". Call it again with those names.";
+}
+
+} // namespace tapto
+
 // Wire formats for tool/function declarations across providers, plus MCP --
 // which is not a provider but is one more spelling of the same three fields,
 // and belongs with them rather than in the server that happens to speak it.
