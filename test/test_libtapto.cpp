@@ -1441,12 +1441,6 @@ void test_openai_stream_accumulator() {
     }
 }
 
-// A whole streamed turn against a local server: a tool round, then the
-// answer, shown as it arrives and returned whole, with the usage reported.
-// A reply cut off at the output limit partway through a tool call's
-// arguments: the next request sends the call back with `{}` (llama.cpp
-// refuses a history holding invalid arguments, every retry alike), and the
-// tool result says it was cut off, with only the start of what came.
 // A required argument missing and an unknown one given: named, not run.
 void test_misnamed_arguments() {
     ToolSpec ed;
@@ -1464,6 +1458,10 @@ void test_misnamed_arguments() {
     CHECK(tapto::misnamed_arguments(ed, json{{"command", "view"}, {"path", "a"}, {"x", 1}}).empty()); // extra only
 }
 
+// A reply cut off at the output limit partway through a tool call's
+// arguments: the next request sends the call back with `{}` (llama.cpp
+// refuses a history holding invalid arguments, every retry alike), and the
+// tool result says it was cut off, with only the start of what came.
 void test_openai_cut_off_tool_call() {
     httplib::Server server;
     std::vector<json> requests;
@@ -1601,6 +1599,8 @@ void test_openai_lost_stream_retried() {
     }
 }
 
+// A whole streamed turn against a local server: a tool round, then the
+// answer, shown as it arrives and returned whole, with the usage reported.
 void test_openai_streamed_chat() {
     httplib::Server server;
     std::vector<json> requests;
