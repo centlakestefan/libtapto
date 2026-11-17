@@ -406,6 +406,9 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
         }
         response = *first;
     }
+    // the latest round's calls all have their results: a stop now leaves
+    // nothing to answer after the loop (it would answer them twice)
+    bool answered = false;
     mclog("Gemini API response body: " + response.dump(2) + "\n");
 
     json candidate = response["candidates"][0];
@@ -543,6 +546,8 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
             {"parts", tool_response_parts}
         });
 
+        answered = true;
+
         // Check for user interruption before the (potentially slow) API call.
         if (context.cancel && context.cancel->check()) break;
 
@@ -559,6 +564,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
         auto next = send();
         if (!next) break;
         response = *next;
+        answered = false;
         mclog("Gemini API response body: " + response.dump(2) + "\n");
 
         candidate = response["candidates"][0];
@@ -588,7 +594,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
 
     // If we stopped with unanswered function calls (iteration cap or user
     // cancel), answer them so the conversation stays valid on the next turn.
-    {
+    if (!answered) {
         json pending = json::array();
         for (const auto& part : model_response_message["parts"]) {
             if (part.contains("functionCall")) {

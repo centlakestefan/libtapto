@@ -97,7 +97,8 @@ bool is_context_overflow(const std::string& error) {
     if (!refused) return false;
     for (const char* m : {"maximum context length", "context_length_exceeded", "context length", "context window",
                           "prompt is too long", "input token count", "too many input tokens",
-                          "maximum number of tokens", "exceeds the context"})
+                          "maximum number of tokens", "exceeds the context", "context size",
+                          "exceed_context_size"})
         if (e.find(m) != std::string::npos) return true;
     return false;
 }

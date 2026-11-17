@@ -496,6 +496,9 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
         }
         response = *first;
     }
+    // the latest round's calls all have their results: a stop now leaves
+    // nothing to answer after the loop (it would answer them twice)
+    bool answered = false;
     if (!response.contains("content") || !response.contains("stop_reason")) {
         throw std::runtime_error("Invalid Claude response: " + response.dump());
     }
@@ -601,6 +604,8 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
             {"content", tool_results}
             });
 
+        answered = true;
+
         // Check for user interruption before the (potentially slow) API call.
         if (context.cancel && context.cancel->check()) break;
 
@@ -619,6 +624,7 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
         auto next = send();
         if (!next) break;
         response = *next;
+        answered = false;
         if (!response.contains("content") || !response.contains("stop_reason")) {
             throw std::runtime_error("Invalid Claude response: " + response.dump());
         }
@@ -639,7 +645,7 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
     // If we stopped with an unanswered tool_use (iteration cap or user cancel),
     // answer it with a synthetic result so the conversation stays valid on the
     // next turn — Claude requires a tool_result after every tool_use.
-    if (has_tool_use(response)) {
+    if (!answered && has_tool_use(response)) {
         json tool_results = json::array();
         std::string reason = user_cancelled
             ? "Tool not run: the turn was stopped before it ran (interrupted, or ended by an earlier call)."

@@ -1479,6 +1479,12 @@ void test_compact_helpers() {
     CHECK(tapto::is_context_overflow("Unexpected HTTP status 400: The input token count exceeds the maximum"));
     CHECK(tapto::is_context_overflow("Bad Request (400): {\"code\":\"context_length_exceeded\"}"));
     CHECK(!tapto::is_context_overflow("Unauthorized (401): Invalid or missing API key"));
+    // llama.cpp's own, new and older
+    CHECK(tapto::is_context_overflow("Bad Request (400): {\"error\":{\"type\":\"exceed_context_size_error\","
+                                     "\"message\":\"the request exceeds the available context size, try increasing "
+                                     "it\"}}"));
+    CHECK(tapto::is_context_overflow("Bad Request (400): the request exceeds the available context size. try "
+                                     "increasing the context size or enable context shift"));
     // a refusal's text only: an error that merely quotes the words is not one
     CHECK(!tapto::is_context_overflow("Server error (500) after 5 retries: the context length was fine"));
 
@@ -1789,6 +1795,89 @@ void test_compact_guard_and_stop() {
             CHECK(client.getHistory().size() >= 3);
             CHECK_EQ(tapto::first_user_text(client.getHistory()), std::string("Do the task."));
         }
+        server.stop();
+        listener.join();
+    }
+}
+
+// ESC while a tool runs: the tool finishes, its result goes in, and the turn
+// stops before the next request with each call answered once, not again as
+// "Tool not run" (two results for one call: the next request refused).
+void test_stop_after_tool_answered_once() {
+    for (const std::string dialect : {"openai", "claude", "gemini"}) {
+        httplib::Server server;
+        int requests = 0;
+        server.Post(R"(.*)", [&](const httplib::Request&, httplib::Response& res) {
+            ++requests;
+            json out;
+            if (dialect == "openai")
+                out = {{"choices",
+                        json::array({{{"message",
+                                       {{"role", "assistant"},
+                                        {"content", nullptr},
+                                        {"tool_calls", json::array({{{"id", "c1"},
+                                                                     {"type", "function"},
+                                                                     {"function", {{"name", "slow"}, {"arguments", "{}"}}}}})}}},
+                                      {"finish_reason", "tool_calls"}}})}};
+            else if (dialect == "claude")
+                out = {{"content", json::array({{{"type", "tool_use"}, {"id", "c1"}, {"name", "slow"},
+                                                 {"input", json::object()}}})},
+                       {"stop_reason", "tool_use"}};
+            else
+                out = {{"candidates",
+                        json::array({{{"content", {{"role", "model"},
+                                                   {"parts", json::array({{{"functionCall",
+                                                                            {{"name", "slow"}, {"args", json::object()}}}}})}}},
+                                      {"finishReason", "STOP"}}})}};
+            res.set_content(out.dump(), "application/json");
+        });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        CHECK(port > 0);
+        if (port <= 0) return;
+        std::thread listener([&] { server.listen_after_bind(); });
+        server.wait_until_ready();
+
+        AiConfig cfg;
+        std::atomic<bool> esc{false};
+        ToolSpec slow;
+        slow.name = "slow";
+        slow.description = "slow";
+        slow.executor = [&](Context&, const json&) {
+            esc = true; // ESC pressed while it runs
+            return std::string("finished");
+        };
+        const std::string url = "http://127.0.0.1:" + std::to_string(port);
+        std::unique_ptr<AiBackend> client;
+        if (dialect == "openai") client = std::make_unique<OpenAIClient>(&cfg, url, "m", "k");
+        else if (dialect == "claude") client = std::make_unique<ClaudeClient>(&cfg, url, "m", "k");
+        else client = std::make_unique<GeminiClient>(&cfg, url, "m", "k");
+        client->start();
+        CancellationToken token;
+        token.setCheckFn([&] { return esc.load(); });
+        Context ctx;
+        ctx.cancel = &token;
+        ctx.tools.push_back(slow);
+        try {
+            client->chat(ctx, "go");
+        } catch (const std::exception& e) {
+            std::cerr << "stop after tool (" << dialect << "): " << e.what() << "\n";
+            CHECK(false);
+        }
+        CHECK_EQ(requests, 1);
+        // the call's results in the history: exactly one, the tool's own
+        int results = 0;
+        bool its_own = false;
+        for (const json& m : client->getHistory()) {
+            const std::string d = m.dump();
+            for (std::size_t at = d.find("finished"); at != std::string::npos; at = d.find("finished", at + 1)) {
+                ++results;
+                its_own = true;
+            }
+            for (std::size_t at = d.find("Tool not run"); at != std::string::npos; at = d.find("Tool not run", at + 1))
+                ++results;
+        }
+        CHECK_EQ(results, 1);
+        CHECK(its_own);
         server.stop();
         listener.join();
     }
@@ -2981,6 +3070,7 @@ int main() {
     test_compact_in_turn();
     test_compact_claude_gemini();
     test_compact_guard_and_stop();
+    test_stop_after_tool_answered_once();
     test_compact_reply_cut();
     test_openai_cut_off_tool_call();
     test_openai_lost_stream_retried();

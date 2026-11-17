@@ -609,6 +609,9 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
         }
         response = *first;
     }
+    // the latest round's calls all have their results: a stop now leaves
+    // nothing to answer after the loop (it would answer them twice)
+    bool answered = false;
     if (!response.contains("choices") || response["choices"].empty()) {
         throw std::runtime_error("Invalid OpenAI response: " + response.dump());
     }
@@ -765,6 +768,8 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
                   " image(s) as a user turn\n");
         }
 
+        answered = true;
+
         // Check for user interruption before the (potentially slow) API call.
         if (context.cancel && context.cancel->check()) break;
 
@@ -781,6 +786,7 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
         auto next = send();
         if (!next) break;
         response = *next;
+        answered = false;
         if (!response.contains("choices") || response["choices"].empty()) {
             throw std::runtime_error("Invalid OpenAI response: " + response.dump());
         }
@@ -800,7 +806,7 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
 
     // If we stopped with unanswered tool calls (iteration cap or user cancel),
     // answer them so the conversation stays valid on the next turn.
-    if (message.contains("tool_calls") && !message["tool_calls"].empty()) {
+    if (!answered && message.contains("tool_calls") && !message["tool_calls"].empty()) {
         std::string reason = user_cancelled
             ? "Tool not run: the turn was stopped before it ran (interrupted, or ended by an earlier call)."
             : "Tool not run: iteration limit reached.";
