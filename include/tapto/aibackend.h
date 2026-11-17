@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 class AiConfig;
+class CancellationToken;
 class Context;
 
 // Abstract interface every provider client implements. tapto-code is a chat
@@ -124,26 +125,37 @@ public:
     }
 
     // Compaction inside a turn (tapto/compact.h, AiConfig::setCompactInTurn),
-    // for chat(). fitWindow() before each request: compacts when the request
-    // would not fit the context window, and cuts its reply limit to what is
-    // left when it still would not. compactTurn(): summarizes the
-    // conversation and starts it again from the summary; false, the
-    // conversation as it was, when that could not be done. outputLimit(): the
-    // next request's reply limit.
-    void fitWindow(const AiConfig& cfg);
-    bool compactTurn(const AiConfig& cfg, const std::string& why);
+    // for chat(). beginTurn(): a turn starts, with this user message.
+    // fitWindow() before each request (again: the same request, after a
+    // compaction for it): compacts when the request would not fit the context
+    // window, and cuts its reply limit to what is left when it still would
+    // not; `tools_chars`, its tools' definitions' size. compactTurn():
+    // summarizes the conversation and starts it again from the summary;
+    // false, the conversation as it was, when that could not be done or was
+    // stopped (`cancel`); throws when the request before, or this one, was
+    // compacted already. outputLimit(): the next request's reply limit.
+    // streamConfig(): the config whose stream callback a request tells (none
+    // for the summary's).
+    void beginTurn(const std::string& user_message) {
+        m_turnPrompt = user_message;
+        m_compactedThis = m_compactedPrev = false;
+    }
+    void fitWindow(const AiConfig& cfg, std::size_t tools_chars, const CancellationToken* cancel,
+                   bool again = false);
+    bool compactTurn(const AiConfig& cfg, const std::string& why, const CancellationToken* cancel);
     int outputLimit(const AiConfig& cfg) const;
+    const AiConfig& streamConfig(const AiConfig& cfg) const;
 
 protected:
-    // One request with no tools: `history`, then `prompt` as a user turn,
-    // answered within `max_output_tokens`; the reply's text (its reasoning
-    // when it has none). The conversation is not changed. "": this backend
-    // cannot, and does not compact.
-    virtual std::string requestOnce(const nlohmann::json& history, const std::string& prompt,
-                                    int max_output_tokens) {
-        (void)history;
+    // One request with no tools and no history: `prompt` as the one user
+    // message, answered within `max_output_tokens`, stopped by `cancel`; the
+    // reply's text (its reasoning when it has none). The conversation is not
+    // changed. "": this backend cannot, and does not compact.
+    virtual std::string requestOnce(const std::string& prompt, int max_output_tokens,
+                                    const CancellationToken* cancel) {
         (void)prompt;
         (void)max_output_tokens;
+        (void)cancel;
         return {};
     }
     // The conversation replaced by one user message holding `text`.
@@ -151,10 +163,16 @@ protected:
 
     // fitWindow's: the next request's reply limit when cut (0: the
     // configured one); the history's size (tapto::history_chars) when the
-    // last request was sent, which m_lastInputTokens measured.
+    // last request was sent, which m_lastInputTokens measured; whether this
+    // request and the one before it were compacted for.
     int m_requestOutputLimit = 0;
     std::size_t m_sentChars = 0;
     bool m_compacting = false;
+    bool m_compactedThis = false;
+    bool m_compactedPrev = false;
+    bool m_compactStopped = false; // the last compaction was stopped (cancel)
+    std::string m_turnPrompt;      // the turn's user message, for a compaction's seed
+    const AiConfig* m_quiet = nullptr; // the summary's config while it is asked for
 
 private:
     // Tool-result payloads longer than this many characters are replaced by a

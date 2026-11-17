@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -171,7 +172,7 @@ nlohmann::json GeminiClient::call_gemini(
         tapto::StreamOutcome streamed;
         tapto::GeminiStreamAccumulator acc;
         auto res = streaming ? tapto::post_stream(*m_api_client, stream_path, headers, body_str,
-                                                  *m_config, cancel, acc, streamed)
+                                                  streamConfig(*m_config), cancel, acc, streamed)
                              : m_api_client->Post(path, headers, body_str, "application/json");
 
         // Stopped by the user partway through: what arrived is the reply.
@@ -225,7 +226,7 @@ nlohmann::json GeminiClient::call_gemini(
                         if (!part.contains("text") || !part["text"].is_string()) continue;
                         (part.value("thought", false) ? thought : text) += part["text"].get<std::string>();
                     }
-                    tapto::show_whole(m_config->streamCallback(), thought, text);
+                    tapto::show_whole(streamConfig(*m_config).streamCallback(), thought, text);
                 }
             }
             m_lastInputTokens = resp.value("usageMetadata", json::object()).value("promptTokenCount", 0);
@@ -330,6 +331,7 @@ nlohmann::json GeminiClient::call_gemini(
  *        tools the model calls along the way.
  */
 std::string GeminiClient::chat(Context& context, const std::string& user_message) {
+    beginTurn(user_message);
 
     m_tool_registry.clear();
     m_tools.clear();
@@ -372,21 +374,38 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
 
     // Each request of the turn: kept within the context window, and asked
     // again once compacted when the provider says it was over (compact.h).
-    auto send = [&]() {
-        fitWindow(*m_config);
-        try {
-            return call_gemini("", tool_schemas, m_conversation_history, context.cancel);
-        } catch (const std::runtime_error& e) {
-            if (!tapto::is_context_overflow(e.what()) ||
-                !compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what()))
-                throw;
-            fitWindow(*m_config);
-            return call_gemini("", tool_schemas, m_conversation_history, context.cancel);
+    // None: stopped while a compaction was asked for.
+    const std::size_t tools_chars = tool_schemas.dump().size();
+    auto send = [&]() -> std::optional<json> {
+        fitWindow(*m_config, tools_chars, context.cancel);
+        if (m_compactStopped) return std::nullopt;
+        for (;;) {
+            try {
+                return call_gemini("", tool_schemas, m_conversation_history, context.cancel);
+            } catch (const std::runtime_error& e) {
+                // refused as too long: compacted and asked again; refused
+                // again, compactTurn says it would go round
+                if (!tapto::is_context_overflow(e.what())) throw;
+                if (!compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what(),
+                                 context.cancel)) {
+                    if (m_compactStopped) return std::nullopt;
+                    throw;
+                }
+                fitWindow(*m_config, tools_chars, context.cancel, true);
+            }
         }
     };
 
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = send();
+    json response;
+    {
+        auto first = send();
+        if (!first) {
+            ui::end_status();
+            return std::string();
+        }
+        response = *first;
+    }
     mclog("Gemini API response body: " + response.dump(2) + "\n");
 
     json candidate = response["candidates"][0];
@@ -537,7 +556,9 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = send();
+        auto next = send();
+        if (!next) break;
+        response = *next;
         mclog("Gemini API response body: " + response.dump(2) + "\n");
 
         candidate = response["candidates"][0];
@@ -654,12 +675,13 @@ void GeminiClient::beginWith(const std::string& text) {
     m_conversation_history.push_back({{"role", "user"}, {"parts", {{{"text", text}}}}});
 }
 
-std::string GeminiClient::requestOnce(const json& history, const std::string& prompt, int max_output_tokens) {
+std::string GeminiClient::requestOnce(const std::string& prompt, int max_output_tokens,
+                                   const CancellationToken* cancel) {
     if (!m_api_client) init_api_client();
     m_requestOutputLimit = max_output_tokens;
     json resp;
     try {
-        resp = call_gemini(prompt, json::array(), history, nullptr);
+        resp = call_gemini(prompt, json::array(), json::array(), cancel);
     } catch (...) {
         m_requestOutputLimit = 0;
         throw;

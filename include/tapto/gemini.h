@@ -86,7 +86,7 @@ public:
 
 protected:
     // Compaction inside a turn (tapto/compact.h).
-    std::string requestOnce(const nlohmann::json& history, const std::string& prompt,
-                            int max_output_tokens) override;
+    std::string requestOnce(const std::string& prompt, int max_output_tokens,
+                            const CancellationToken* cancel) override;
     void beginWith(const std::string& text) override;
 };

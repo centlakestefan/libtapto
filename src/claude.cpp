@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -178,7 +179,7 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
         tapto::StreamOutcome streamed;
         tapto::ClaudeStreamAccumulator acc;
         auto res = streaming ? tapto::post_stream(*m_api_client, "/v1/messages", headers, body,
-                                                  *m_config, cancel, acc, streamed)
+                                                  streamConfig(*m_config), cancel, acc, streamed)
                              : m_api_client->Post("/v1/messages", headers, body, "application/json");
 
         // Stopped by the user partway through: what arrived is the reply.
@@ -253,7 +254,7 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
                         if (type == "thinking") thinking += block.value("thinking", std::string());
                         else if (type == "text") text += block.value("text", std::string());
                     }
-                    tapto::show_whole(m_config->streamCallback(), thinking, text);
+                    tapto::show_whole(streamConfig(*m_config).streamCallback(), thinking, text);
                 }
             }
             // Kept for the caller (context-window fill) and logged so cache
@@ -413,6 +414,7 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
 /// <summary>Sends one user message and returns Claude's text reply, running any
 /// tools the model calls along the way.</summary>
 std::string ClaudeClient::chat(Context& context, const std::string& user_message) {
+    beginTurn(user_message);
 
     m_tool_registry.clear();
     m_tools.clear();
@@ -462,21 +464,38 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
 
     // Each request of the turn: kept within the context window, and asked
     // again once compacted when the provider says it was over (compact.h).
-    auto send = [&]() {
-        fitWindow(*m_config);
-        try {
-            return call_claude("", tools, m_conversation_history, context.cancel);
-        } catch (const std::runtime_error& e) {
-            if (!tapto::is_context_overflow(e.what()) ||
-                !compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what()))
-                throw;
-            fitWindow(*m_config);
-            return call_claude("", tools, m_conversation_history, context.cancel);
+    // None: stopped while a compaction was asked for.
+    const std::size_t tools_chars = tools.dump().size();
+    auto send = [&]() -> std::optional<json> {
+        fitWindow(*m_config, tools_chars, context.cancel);
+        if (m_compactStopped) return std::nullopt;
+        for (;;) {
+            try {
+                return call_claude("", tools, m_conversation_history, context.cancel);
+            } catch (const std::runtime_error& e) {
+                // refused as too long: compacted and asked again; refused
+                // again, compactTurn says it would go round
+                if (!tapto::is_context_overflow(e.what())) throw;
+                if (!compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what(),
+                                 context.cancel)) {
+                    if (m_compactStopped) return std::nullopt;
+                    throw;
+                }
+                fitWindow(*m_config, tools_chars, context.cancel, true);
+            }
         }
     };
 
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = send();
+    json response;
+    {
+        auto first = send();
+        if (!first) {
+            ui::end_status();
+            return std::string();
+        }
+        response = *first;
+    }
     if (!response.contains("content") || !response.contains("stop_reason")) {
         throw std::runtime_error("Invalid Claude response: " + response.dump());
     }
@@ -597,7 +616,9 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = send();
+        auto next = send();
+        if (!next) break;
+        response = *next;
         if (!response.contains("content") || !response.contains("stop_reason")) {
             throw std::runtime_error("Invalid Claude response: " + response.dump());
         }
@@ -708,12 +729,13 @@ void ClaudeClient::beginWith(const std::string& text) {
     m_conversation_history.push_back({{"role", "user"}, {"content", text}});
 }
 
-std::string ClaudeClient::requestOnce(const json& history, const std::string& prompt, int max_output_tokens) {
+std::string ClaudeClient::requestOnce(const std::string& prompt, int max_output_tokens,
+                                   const CancellationToken* cancel) {
     if (!m_api_client) init_api_client();
     m_requestOutputLimit = max_output_tokens;
     json resp;
     try {
-        resp = call_claude(prompt, json::array(), history, nullptr);
+        resp = call_claude(prompt, json::array(), json::array(), cancel);
     } catch (...) {
         m_requestOutputLimit = 0;
         throw;

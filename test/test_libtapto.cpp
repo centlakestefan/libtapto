@@ -1460,19 +1460,50 @@ void test_misnamed_arguments() {
 
 // Compaction inside a turn: the pieces (compact.h).
 void test_compact_helpers() {
-    const std::string seed = tapto::compact_seed("Do the task.", "Read a.go; b.go remains.", "M a.go");
+    const std::string seed = tapto::compact_seed("Do the task.", "", "Read a.go; b.go remains.", "M a.go");
     CHECK(seed.rfind("Do the task.\n\n---\n(This conversation outgrew", 0) == 0);
     CHECK(seed.find("## Summary of the work so far\n\nRead a.go; b.go remains.") != std::string::npos);
     CHECK(seed.find("## The state of the work now\n\nM a.go") != std::string::npos);
+    CHECK(seed.find("request being worked on") == std::string::npos);
     CHECK_EQ(tapto::task_of_seed(seed), std::string("Do the task."));
     CHECK_EQ(tapto::task_of_seed("Do the task."), std::string("Do the task."));
-    CHECK(tapto::compact_seed("T", "S", "").find("state of the work") == std::string::npos);
+    CHECK(tapto::compact_seed("T", "T", "S", "").find("state of the work") == std::string::npos);
+    CHECK(tapto::compact_seed("T", "T", "S", "").find("request being worked on") == std::string::npos);
+    // a later turn's own request beside the first one
+    CHECK(tapto::compact_seed("T", "Now fix the tests.", "S", "")
+              .find("## The request being worked on now\n\nNow fix the tests.") != std::string::npos);
 
     CHECK(tapto::is_context_overflow("Bad Request (400): ... Requested token count exceeds the model's maximum "
                                      "context length of 262144 tokens."));
-    CHECK(tapto::is_context_overflow("Client error (400): prompt is too long: 210000 tokens > 200000 maximum"));
-    CHECK(tapto::is_context_overflow("{\"code\":\"context_length_exceeded\"}"));
+    CHECK(tapto::is_context_overflow("Client error (413): prompt is too long: 210000 tokens > 200000 maximum"));
+    CHECK(tapto::is_context_overflow("Unexpected HTTP status 400: The input token count exceeds the maximum"));
+    CHECK(tapto::is_context_overflow("Bad Request (400): {\"code\":\"context_length_exceeded\"}"));
     CHECK(!tapto::is_context_overflow("Unauthorized (401): Invalid or missing API key"));
+    // a refusal's text only: an error that merely quotes the words is not one
+    CHECK(!tapto::is_context_overflow("Server error (500) after 5 retries: the context length was fine"));
+
+    // a transcript of any dialect: who said what, the calls and their results
+    const std::string t = tapto::transcript(json::array(
+        {{{"role", "user"}, {"content", "Do it."}},
+         {{"role", "assistant"},
+          {"content", nullptr},
+          {"tool_calls", json::array({{{"id", "c"}, {"function", {{"name", "read"}, {"arguments", "{\"p\":1}"}}}}})}},
+         {{"role", "tool"}, {"tool_call_id", "c"}, {"content", "file text"}},
+         {{"role", "assistant"},
+          {"content", json::array({{{"type", "thinking"}, {"thinking", "hmm"}},
+                                   {{"type", "tool_use"}, {"id", "u"}, {"name", "edit"}, {"input", {{"q", 2}}}}})}},
+         {{"role", "user"}, {"content", json::array({{{"type", "tool_result"}, {"tool_use_id", "u"}, {"content", "ok"}}})}},
+         {{"role", "model"}, {"parts", json::array({{{"functionCall", {{"name", "build"}, {"args", json::object()}}}}})}},
+         {{"role", "user"},
+          {"parts", json::array({{{"functionResponse", {{"name", "build"}, {"response", {{"content", "built"}}}}}}})}}}));
+    CHECK(t.find("### user\nDo it.") != std::string::npos);
+    CHECK(t.find("[calls read with {\"p\":1}]") != std::string::npos);
+    CHECK(t.find("### tool result\nfile text") != std::string::npos);
+    CHECK(t.find("[calls edit with {\"q\":2}]") != std::string::npos);
+    CHECK(t.find("### tool result\nok") != std::string::npos);
+    CHECK(t.find("[calls build with {}]") != std::string::npos);
+    CHECK(t.find("### tool result\nbuilt") != std::string::npos);
+    CHECK(t.find("hmm") == std::string::npos);
 
     // the first user message of each dialect, tool results skipped
     CHECK_EQ(tapto::first_user_text(json::array({{{"role", "user"}, {"content", "go"}}})), std::string("go"));
@@ -1533,6 +1564,10 @@ void test_compact_in_turn() {
         cfg.setMaxOutputTokens(1024);
         cfg.setCompactInTurn(trigger != "off");
         if (trigger == "window") cfg.setContextWindow(3000);
+        // replies shown as they come: the summary is not one of them
+        std::string shown;
+        cfg.setStream(true);
+        cfg.setStreamCallback([&](const tapto::StreamEvent& ev) { shown += ev.text; });
         std::vector<tapto::CompactInfo> told;
         cfg.setCompactCallback([&](const tapto::CompactInfo& i) {
             told.push_back(i);
@@ -1572,6 +1607,16 @@ void test_compact_in_turn() {
             if (summary) {
                 CHECK(summary->dump().find("omitted tool output (8000 chars)") != std::string::npos);
                 CHECK(summary->value("max_tokens", 0) <= tapto::kCompactReplyTokens);
+                // one user message: the transcript, then the ask
+                CHECK_EQ((*summary)["messages"].size(), std::size_t(1));
+                const std::string asked = (*summary)["messages"][0].value("content", "");
+                CHECK(asked.find("### user\nDo the task.") != std::string::npos);
+                CHECK(asked.find("[calls read with {}]") != std::string::npos);
+                CHECK(asked.find("Summarize it as a compact, structured note") != std::string::npos);
+            }
+            CHECK(shown.find("Done.") != std::string::npos);
+            CHECK(shown.find("SUMMARY") == std::string::npos);
+            {
             }
             // the request after it: one message, the task, the summary, the state
             const json& last = requests.back();
@@ -1665,6 +1710,84 @@ void test_compact_claude_gemini() {
             CHECK(seed.rfind("Do the task.", 0) == 0);
             CHECK(seed.find("SUMMARY: read.") != std::string::npos);
             CHECK(seed.find("M a.go") != std::string::npos);
+        }
+        server.stop();
+        listener.join();
+    }
+}
+
+// A conversation still too long straight after its compaction: the turn
+// fails, not compacted again and again. And a turn stopped while its summary
+// is asked for: stopped, the conversation as it was.
+void test_compact_guard_and_stop() {
+    for (const std::string what : {"guard", "stop"}) {
+        httplib::Server server;
+        std::vector<json> requests;
+        std::atomic<bool> esc{false};
+        int turns = 0;
+        server.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+            const json body = json::parse(req.body);
+            requests.push_back(body);
+            json message = {{"role", "assistant"}, {"content", "SUMMARY: more."}};
+            if (!body.contains("tools")) {
+                if (what == "stop") esc = true; // ESC while the summary is written
+            } else if (++turns == 1) {
+                message = {{"role", "assistant"},
+                           {"content", nullptr},
+                           {"tool_calls", json::array({{{"id", "t0"},
+                                                        {"type", "function"},
+                                                        {"function", {{"name", "read"}, {"arguments", "{}"}}}}})}};
+            } else {
+                res.status = 400;
+                res.set_content(R"({"message":"This model's maximum context length is 3000 tokens."})",
+                                "application/json");
+                return;
+            }
+            res.set_content(json{{"choices", json::array({{{"message", message}, {"finish_reason", "stop"}}})}}.dump(),
+                            "application/json");
+        });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        CHECK(port > 0);
+        if (port <= 0) return;
+        std::thread listener([&] { server.listen_after_bind(); });
+        server.wait_until_ready();
+
+        AiConfig cfg;
+        cfg.setCompactInTurn(true);
+        int told = 0;
+        cfg.setCompactCallback([&](const tapto::CompactInfo&) {
+            ++told;
+            return std::string();
+        });
+        ToolSpec read;
+        read.name = "read";
+        read.description = "read";
+        read.executor = [](Context&, const json&) { return std::string("x"); };
+        OpenAIClient client(&cfg, "http://127.0.0.1:" + std::to_string(port), "m", "k");
+        client.start();
+        CancellationToken token;
+        token.setCheckFn([&] { return esc.load(); });
+        Context ctx;
+        ctx.cancel = &token;
+        ctx.tools.push_back(read);
+        std::string error;
+        try {
+            client.chat(ctx, "Do the task.");
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        if (what == "guard") {
+            // refused, compacted, refused again: the turn's error says why
+            CHECK(error.find("again right after it was compacted") != std::string::npos);
+            CHECK_EQ(told, 1);
+            CHECK_EQ(requests.size(), std::size_t(4)); // the call, refused, summary, refused
+        } else {
+            CHECK(error.empty());
+            CHECK_EQ(told, 0);
+            CHECK_EQ(requests.size(), std::size_t(3)); // the call, refused, summary: no more
+            // the conversation as it was: the task and its tool round still there
+            CHECK(client.getHistory().size() >= 3);
+            CHECK_EQ(tapto::first_user_text(client.getHistory()), std::string("Do the task."));
         }
         server.stop();
         listener.join();
@@ -2857,6 +2980,7 @@ int main() {
     test_compact_helpers();
     test_compact_in_turn();
     test_compact_claude_gemini();
+    test_compact_guard_and_stop();
     test_compact_reply_cut();
     test_openai_cut_off_tool_call();
     test_openai_lost_stream_retried();
