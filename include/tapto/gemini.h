@@ -83,4 +83,10 @@ public:
     // Seed a fresh conversation with a summary of the previous discussion (/compact).
     // Gemini messages use `parts` (not `content`), hence the dedicated method.
     void beginWithSummary(const std::string& summaryText) override;
+
+protected:
+    // Compaction inside a turn (tapto/compact.h).
+    std::string requestOnce(const nlohmann::json& history, const std::string& prompt,
+                            int max_output_tokens) override;
+    void beginWith(const std::string& text) override;
 };

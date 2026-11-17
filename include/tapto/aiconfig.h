@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 
+#include "tapto/compact.h"
 #include "tapto/stream.h"
 #include "tapto/usage.h"
 
@@ -29,6 +30,9 @@ public:
     bool stream() const { return m_stream; }
     const tapto::StreamCallback& streamCallback() const { return m_streamCallback; }
     bool retryLostReply() const { return m_retryLostReply; }
+    bool compactInTurn() const { return m_compactInTurn; }
+    int contextWindow() const { return m_contextWindow; }
+    const tapto::CompactCallback& compactCallback() const { return m_compactCallback; }
     // Whether the pieces of a reply reach the program as they arrive, so the
     // clients do not show them again through ui::emit_intermediate.
     bool showsStream() const { return m_stream && static_cast<bool>(m_streamCallback); }
@@ -49,6 +53,9 @@ public:
     void setStream(bool v) { m_stream = v; }
     void setStreamCallback(tapto::StreamCallback v) { m_streamCallback = std::move(v); }
     void setRetryLostReply(bool v) { m_retryLostReply = v; }
+    void setCompactInTurn(bool v) { m_compactInTurn = v; }
+    void setContextWindow(int v) { m_contextWindow = v; }
+    void setCompactCallback(tapto::CompactCallback v) { m_compactCallback = std::move(v); }
 
 private:
     int m_maxOutputTokens = 16000;
@@ -126,4 +133,17 @@ private:
     // reply a second time, and a different one. A program whose replies
     // nobody watches as they come (a server's agents) turns it on.
     bool m_retryLostReply = false;
+
+    // Compaction inside a turn (tapto/compact.h): chat() summarizes the
+    // conversation and goes on from the summary when the next request would
+    // pass the context window, or when the provider refused one as over its
+    // context length. Off: such a request fails, as before, and a person
+    // types /compact. A program whose agents run on their own turns it on.
+    bool m_compactInTurn = false;
+    // The model's context window in tokens, input and reply together. 0:
+    // unknown, and only the provider's refusal starts a compaction. Known,
+    // a request is also kept within it: compacted before it would not fit,
+    // its reply limit cut to what is left when that still falls short.
+    int m_contextWindow = 0;
+    tapto::CompactCallback m_compactCallback;
 };

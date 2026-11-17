@@ -113,7 +113,7 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
     // Build request body
     json request_body = {
         {"model", m_model},
-        {"max_tokens", m_config->maxOutputTokens()},
+        {"max_tokens", outputLimit(*m_config)},
         {"messages", messages}
     };
 
@@ -460,8 +460,23 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
             });
     }
 
+    // Each request of the turn: kept within the context window, and asked
+    // again once compacted when the provider says it was over (compact.h).
+    auto send = [&]() {
+        fitWindow(*m_config);
+        try {
+            return call_claude("", tools, m_conversation_history, context.cancel);
+        } catch (const std::runtime_error& e) {
+            if (!tapto::is_context_overflow(e.what()) ||
+                !compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what()))
+                throw;
+            fitWindow(*m_config);
+            return call_claude("", tools, m_conversation_history, context.cancel);
+        }
+    };
+
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = call_claude("", tools, m_conversation_history, context.cancel);
+    json response = send();
     if (!response.contains("content") || !response.contains("stop_reason")) {
         throw std::runtime_error("Invalid Claude response: " + response.dump());
     }
@@ -582,7 +597,7 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = call_claude("", tools, m_conversation_history, context.cancel);
+        response = send();
         if (!response.contains("content") || !response.contains("stop_reason")) {
             throw std::runtime_error("Invalid Claude response: " + response.dump());
         }
@@ -683,13 +698,35 @@ json ClaudeClient::getHistory() const {
 
 /// <summary>Starts a new conversation seeded with a summary of the previous one (/compact).</summary>
 void ClaudeClient::beginWithSummary(const std::string& summaryText) {
+    beginWith("(The conversation prior to this point has been summarized for context):\n" + summaryText);
+    mclog("Started conversation seeded with summary of previous discussion");
+}
+
+void ClaudeClient::beginWith(const std::string& text) {
     resetTokenAccounting();
     m_conversation_history = json::array();
-    m_conversation_history.push_back({
-        {"role", "user"},
-        {"content", "(The conversation prior to this point has been summarized for context):\n" + summaryText}
-    });
-    mclog("Started conversation seeded with summary of previous discussion");
+    m_conversation_history.push_back({{"role", "user"}, {"content", text}});
+}
+
+std::string ClaudeClient::requestOnce(const json& history, const std::string& prompt, int max_output_tokens) {
+    if (!m_api_client) init_api_client();
+    m_requestOutputLimit = max_output_tokens;
+    json resp;
+    try {
+        resp = call_claude(prompt, json::array(), history, nullptr);
+    } catch (...) {
+        m_requestOutputLimit = 0;
+        throw;
+    }
+    m_requestOutputLimit = 0;
+    std::string text, thinking;
+    if (resp.contains("content") && resp["content"].is_array())
+        for (const json& block : resp["content"]) {
+            const std::string type = block.value("type", std::string());
+            if (type == "text") text += block.value("text", std::string());
+            else if (type == "thinking") thinking += block.value("thinking", std::string());
+        }
+    return text.empty() ? thinking : text;
 }
 
 /// <summary>Sets the model for Claude client.</summary>

@@ -1458,6 +1458,267 @@ void test_misnamed_arguments() {
     CHECK(tapto::misnamed_arguments(ed, json{{"command", "view"}, {"path", "a"}, {"x", 1}}).empty()); // extra only
 }
 
+// Compaction inside a turn: the pieces (compact.h).
+void test_compact_helpers() {
+    const std::string seed = tapto::compact_seed("Do the task.", "Read a.go; b.go remains.", "M a.go");
+    CHECK(seed.rfind("Do the task.\n\n---\n(This conversation outgrew", 0) == 0);
+    CHECK(seed.find("## Summary of the work so far\n\nRead a.go; b.go remains.") != std::string::npos);
+    CHECK(seed.find("## The state of the work now\n\nM a.go") != std::string::npos);
+    CHECK_EQ(tapto::task_of_seed(seed), std::string("Do the task."));
+    CHECK_EQ(tapto::task_of_seed("Do the task."), std::string("Do the task."));
+    CHECK(tapto::compact_seed("T", "S", "").find("state of the work") == std::string::npos);
+
+    CHECK(tapto::is_context_overflow("Bad Request (400): ... Requested token count exceeds the model's maximum "
+                                     "context length of 262144 tokens."));
+    CHECK(tapto::is_context_overflow("Client error (400): prompt is too long: 210000 tokens > 200000 maximum"));
+    CHECK(tapto::is_context_overflow("{\"code\":\"context_length_exceeded\"}"));
+    CHECK(!tapto::is_context_overflow("Unauthorized (401): Invalid or missing API key"));
+
+    // the first user message of each dialect, tool results skipped
+    CHECK_EQ(tapto::first_user_text(json::array({{{"role", "user"}, {"content", "go"}}})), std::string("go"));
+    CHECK_EQ(tapto::first_user_text(json::array(
+                 {{{"role", "user"}, {"content", json::array({{{"type", "tool_result"}, {"content", "x"}}})}},
+                  {{"role", "user"}, {"content", json::array({{{"type", "text"}, {"text", "go"}}})}}})),
+             std::string("go"));
+    CHECK_EQ(tapto::first_user_text(json::array({{{"role", "user"}, {"parts", json::array({{{"text", "go"}}})}}})),
+             std::string("go"));
+
+    // an image counts as one, not as its bytes
+    const json with_image = json::array(
+        {{{"role", "user"},
+          {"content", json::array({{{"type", "image_url"},
+                                    {"image_url", {{"url", "data:image/png;base64," + std::string(500000, 'A')}}}}})}}});
+    CHECK(tapto::history_chars(with_image) < 10000);
+}
+
+// A long turn against a server whose window it outgrows: compacted before the
+// request that would not fit, or when the server refuses one as too long, and
+// carried on from the task, the summary and the program's state of the work.
+void test_compact_in_turn() {
+    for (const std::string trigger : {"window", "refusal", "off"}) {
+        httplib::Server server;
+        std::vector<json> requests;
+        int turns = 0; // the requests with tools
+        server.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+            const json body = json::parse(req.body);
+            requests.push_back(body);
+            json message = {{"role", "assistant"}, {"content", "Done."}};
+            if (!body.contains("tools")) {
+                message["content"] = "SUMMARY: a.go read, b.go next.";
+            } else if (++turns == 1) {
+                message = {{"role", "assistant"},
+                           {"content", nullptr},
+                           {"tool_calls", json::array({{{"id", "t0"},
+                                                        {"type", "function"},
+                                                        {"function", {{"name", "read"}, {"arguments", "{}"}}}}})}};
+            } else if (turns == 2 && trigger != "window") {
+                res.status = 400;
+                res.set_content("{\"object\":\"error\",\"message\":\"This model's maximum context length is 3000 "
+                                "tokens.\"}",
+                                "application/json");
+                return;
+            }
+            res.set_content(json{{"choices", json::array({{{"message", message}, {"finish_reason", "stop"}}})},
+                                 {"usage", {{"prompt_tokens", 900}, {"completion_tokens", 10}}}}
+                                .dump(),
+                            "application/json");
+        });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        CHECK(port > 0);
+        if (port <= 0) return;
+        std::thread listener([&] { server.listen_after_bind(); });
+        server.wait_until_ready();
+
+        AiConfig cfg;
+        cfg.setMaxOutputTokens(1024);
+        cfg.setCompactInTurn(trigger != "off");
+        if (trigger == "window") cfg.setContextWindow(3000);
+        std::vector<tapto::CompactInfo> told;
+        cfg.setCompactCallback([&](const tapto::CompactInfo& i) {
+            told.push_back(i);
+            return std::string("M a.go");
+        });
+        ToolSpec read;
+        read.name = "read";
+        read.description = "read";
+        read.executor = [](Context&, const json&) { return std::string(8000, 'x'); };
+        OpenAIClient client(&cfg, "http://127.0.0.1:" + std::to_string(port), "m", "k");
+        client.start();
+        Context ctx;
+        ctx.tools.push_back(read);
+        std::string reply, error;
+        try {
+            reply = client.chat(ctx, "Do the task.");
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        if (trigger == "off") {
+            // as before: the refusal is the turn's error
+            CHECK(error.find("maximum context length") != std::string::npos);
+            CHECK(told.empty());
+        } else {
+            if (!error.empty()) std::cerr << "compact (" << trigger << "): " << error << "\n";
+            CHECK_EQ(reply, std::string("Done."));
+            CHECK_EQ(told.size(), std::size_t(1));
+            if (!told.empty())
+                CHECK(told[0].why.find(trigger == "window" ? "would not fit the context window"
+                                                           : "the provider said the request was too long") !=
+                      std::string::npos);
+            // the summary: no tools, the long tool output omitted, a reply within the window
+            const json* summary = nullptr;
+            for (const json& r : requests)
+                if (!r.contains("tools")) summary = &r;
+            CHECK(summary != nullptr);
+            if (summary) {
+                CHECK(summary->dump().find("omitted tool output (8000 chars)") != std::string::npos);
+                CHECK(summary->value("max_tokens", 0) <= tapto::kCompactReplyTokens);
+            }
+            // the request after it: one message, the task, the summary, the state
+            const json& last = requests.back();
+            CHECK(last.contains("tools"));
+            CHECK_EQ(last["messages"].size(), std::size_t(1));
+            const std::string seed = last["messages"][0].value("content", "");
+            CHECK(seed.rfind("Do the task.", 0) == 0);
+            CHECK(seed.find("SUMMARY: a.go read, b.go next.") != std::string::npos);
+            CHECK(seed.find("M a.go") != std::string::npos);
+            CHECK(seed.find(std::string(8000, 'x')) == std::string::npos);
+            CHECK_EQ(requests.size(), std::size_t(trigger == "window" ? 3 : 4));
+        }
+        server.stop();
+        listener.join();
+    }
+}
+
+// Claude and Gemini refusing a request as too long: compacted the same way,
+// the new conversation in their own shape.
+void test_compact_claude_gemini() {
+    for (const std::string dialect : {"claude", "gemini"}) {
+        httplib::Server server;
+        std::vector<json> requests;
+        int turns = 0;
+        server.Post(R"(.*)", [&](const httplib::Request& req, httplib::Response& res) {
+            const json body = json::parse(req.body);
+            requests.push_back(body);
+            const bool tools = body.contains("tools");
+            const int turn = tools ? ++turns : 0;
+            if (turn == 2) {
+                res.status = 400;
+                res.set_content(dialect == "claude"
+                                    ? "{\"type\":\"error\",\"error\":{\"message\":\"prompt is too long: 300000 tokens > "
+                                      "200000 maximum\"}}"
+                                    : "{\"error\":{\"message\":\"The input token count exceeds the maximum number of "
+                                      "tokens allowed.\"}}",
+                                "application/json");
+                return;
+            }
+            const std::string text = !tools ? "SUMMARY: read." : "Done.";
+            json out;
+            if (dialect == "claude") {
+                json content = turn == 1 ? json::array({{{"type", "tool_use"}, {"id", "u1"}, {"name", "read"},
+                                                         {"input", json::object()}}})
+                                         : json::array({{{"type", "text"}, {"text", text}}});
+                out = {{"content", content},
+                       {"stop_reason", turn == 1 ? "tool_use" : "end_turn"},
+                       {"usage", {{"input_tokens", 900}, {"output_tokens", 5}}}};
+            } else {
+                json parts = turn == 1 ? json::array({{{"functionCall", {{"name", "read"}, {"args", json::object()}}}}})
+                                       : json::array({{{"text", text}}});
+                out = {{"candidates", json::array({{{"content", {{"role", "model"}, {"parts", parts}}},
+                                                    {"finishReason", "STOP"}}})},
+                       {"usageMetadata", {{"promptTokenCount", 900}}}};
+            }
+            res.set_content(out.dump(), "application/json");
+        });
+        const int port = server.bind_to_any_port("127.0.0.1");
+        CHECK(port > 0);
+        if (port <= 0) return;
+        std::thread listener([&] { server.listen_after_bind(); });
+        server.wait_until_ready();
+
+        AiConfig cfg;
+        cfg.setCompactInTurn(true);
+        cfg.setCompactCallback([](const tapto::CompactInfo&) { return std::string("M a.go"); });
+        ToolSpec read;
+        read.name = "read";
+        read.description = "read";
+        read.executor = [](Context&, const json&) { return std::string(8000, 'x'); };
+        const std::string url = "http://127.0.0.1:" + std::to_string(port);
+        std::unique_ptr<AiBackend> client;
+        if (dialect == "claude") client = std::make_unique<ClaudeClient>(&cfg, url, "m", "k");
+        else client = std::make_unique<GeminiClient>(&cfg, url, "m", "k");
+        client->start();
+        Context ctx;
+        ctx.tools.push_back(read);
+        std::string reply;
+        try {
+            reply = client->chat(ctx, "Do the task.");
+        } catch (const std::exception& e) {
+            std::cerr << "compact (" << dialect << "): " << e.what() << "\n";
+        }
+        CHECK_EQ(reply, std::string("Done."));
+        CHECK_EQ(requests.size(), std::size_t(4));
+        if (requests.size() == 4) {
+            const json& last = requests.back();
+            const json& msgs = dialect == "claude" ? last["messages"] : last["contents"];
+            CHECK_EQ(msgs.size(), std::size_t(1));
+            const std::string seed = tapto::first_user_text(msgs);
+            CHECK(seed.rfind("Do the task.", 0) == 0);
+            CHECK(seed.find("SUMMARY: read.") != std::string::npos);
+            CHECK(seed.find("M a.go") != std::string::npos);
+        }
+        server.stop();
+        listener.join();
+    }
+}
+
+// With a known window and no summary to be had, the request still goes, its
+// reply limit cut to what the window leaves.
+void test_compact_reply_cut() {
+    httplib::Server server;
+    std::vector<json> requests;
+    server.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+        const json body = json::parse(req.body);
+        requests.push_back(body);
+        json message = {{"role", "assistant"}, {"content", body.contains("tools") ? "Done." : ""}};
+        res.set_content(json{{"choices", json::array({{{"message", message}, {"finish_reason", "stop"}}})}}.dump(),
+                        "application/json");
+    });
+    const int port = server.bind_to_any_port("127.0.0.1");
+    CHECK(port > 0);
+    if (port <= 0) return;
+    std::thread listener([&] { server.listen_after_bind(); });
+    server.wait_until_ready();
+
+    AiConfig cfg;
+    cfg.setMaxOutputTokens(4000);
+    cfg.setCompactInTurn(true);
+    cfg.setContextWindow(6000);
+    ToolSpec none;
+    none.name = "none";
+    none.description = "none";
+    none.executor = [](Context&, const json&) { return std::string(); };
+    OpenAIClient client(&cfg, "http://127.0.0.1:" + std::to_string(port), "m", "k");
+    client.start();
+    Context ctx;
+    ctx.tools.push_back(none);
+    std::string reply;
+    try {
+        reply = client.chat(ctx, std::string(12000, 'w')); // about 3000 tokens
+    } catch (const std::exception& e) {
+        std::cerr << "reply cut: " << e.what() << "\n";
+    }
+    CHECK_EQ(reply, std::string("Done."));
+    // a summary was asked for and came back empty: the conversation as it was
+    CHECK_EQ(requests.size(), std::size_t(2));
+    if (requests.size() == 2) {
+        const int limit = requests[1].value("max_tokens", 0);
+        CHECK(limit >= 1024 && limit < 4000);
+        CHECK(requests[1]["messages"][0].value("content", "") == std::string(12000, 'w'));
+    }
+    server.stop();
+    listener.join();
+}
+
 // A reply cut off at the output limit partway through a tool call's
 // arguments: the next request sends the call back with `{}` (llama.cpp
 // refuses a history holding invalid arguments, every retry alike), and the
@@ -2593,6 +2854,10 @@ int main() {
     test_sse_parser();
     test_openai_stream_accumulator();
     test_misnamed_arguments();
+    test_compact_helpers();
+    test_compact_in_turn();
+    test_compact_claude_gemini();
+    test_compact_reply_cut();
     test_openai_cut_off_tool_call();
     test_openai_lost_stream_retried();
     test_openai_streamed_chat();

@@ -127,7 +127,7 @@ nlohmann::json GeminiClient::call_gemini(
         {"temperature", 1.0},
         {"topP", 0.95},
         {"topK", 40},
-        {"maxOutputTokens", m_config->maxOutputTokens()}
+        {"maxOutputTokens", outputLimit(*m_config)}
     };
 
     // Provider-level extended-thinking override.
@@ -370,8 +370,23 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
         });
     }
 
+    // Each request of the turn: kept within the context window, and asked
+    // again once compacted when the provider says it was over (compact.h).
+    auto send = [&]() {
+        fitWindow(*m_config);
+        try {
+            return call_gemini("", tool_schemas, m_conversation_history, context.cancel);
+        } catch (const std::runtime_error& e) {
+            if (!tapto::is_context_overflow(e.what()) ||
+                !compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what()))
+                throw;
+            fitWindow(*m_config);
+            return call_gemini("", tool_schemas, m_conversation_history, context.cancel);
+        }
+    };
+
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = call_gemini("", tool_schemas, m_conversation_history, context.cancel);
+    json response = send();
     mclog("Gemini API response body: " + response.dump(2) + "\n");
 
     json candidate = response["candidates"][0];
@@ -522,7 +537,7 @@ std::string GeminiClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = call_gemini("", tool_schemas, m_conversation_history, context.cancel);
+        response = send();
         mclog("Gemini API response body: " + response.dump(2) + "\n");
 
         candidate = response["candidates"][0];
@@ -629,15 +644,36 @@ json GeminiClient::getHistory() const {
 /// Gemini messages carry `parts` rather than `content`, so the seed is built
 /// in that native shape (the first message must be a user turn).
 void GeminiClient::beginWithSummary(const std::string& summaryText) {
+    beginWith("(The conversation prior to this point has been summarized for context):\n" + summaryText);
+    mclog("Started conversation seeded with summary of previous discussion");
+}
+
+void GeminiClient::beginWith(const std::string& text) {
     resetTokenAccounting();
     m_conversation_history = json::array();
-    m_conversation_history.push_back({
-        {"role", "user"},
-        {"parts", {
-            {{"text", "(The conversation prior to this point has been summarized for context):\n" + summaryText}}
-        }}
-    });
-    mclog("Started conversation seeded with summary of previous discussion");
+    m_conversation_history.push_back({{"role", "user"}, {"parts", {{{"text", text}}}}});
+}
+
+std::string GeminiClient::requestOnce(const json& history, const std::string& prompt, int max_output_tokens) {
+    if (!m_api_client) init_api_client();
+    m_requestOutputLimit = max_output_tokens;
+    json resp;
+    try {
+        resp = call_gemini(prompt, json::array(), history, nullptr);
+    } catch (...) {
+        m_requestOutputLimit = 0;
+        throw;
+    }
+    m_requestOutputLimit = 0;
+    std::string text, thought;
+    if (resp.contains("candidates") && resp["candidates"].is_array() && !resp["candidates"].empty()) {
+        const json content = resp["candidates"][0].value("content", json::object());
+        if (content.contains("parts") && content["parts"].is_array())
+            for (const json& part : content["parts"])
+                if (part.contains("text") && part["text"].is_string())
+                    (part.value("thought", false) ? thought : text) += part["text"].get<std::string>();
+    }
+    return text.empty() ? thought : text;
 }
 
 /// <summary>Sets the model for Gemini client.</summary>

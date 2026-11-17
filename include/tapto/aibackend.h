@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+class AiConfig;
 class Context;
 
 // Abstract interface every provider client implements. tapto-code is a chat
@@ -45,7 +46,10 @@ public:
 
     // Reset the request accounting (start() re-clears the conversation and
     // beginWithSummary() replaces it with a /compact summary).
-    virtual void resetTokenAccounting() { m_lastInputTokens = 0; }
+    virtual void resetTokenAccounting() {
+        m_lastInputTokens = 0;
+        m_sentChars = 0;
+    }
     std::size_t m_lastInputTokens = 0;
 
     // Replace the conversation with a fresh one whose first user turn carries
@@ -118,6 +122,39 @@ public:
         }
         return history;
     }
+
+    // Compaction inside a turn (tapto/compact.h, AiConfig::setCompactInTurn),
+    // for chat(). fitWindow() before each request: compacts when the request
+    // would not fit the context window, and cuts its reply limit to what is
+    // left when it still would not. compactTurn(): summarizes the
+    // conversation and starts it again from the summary; false, the
+    // conversation as it was, when that could not be done. outputLimit(): the
+    // next request's reply limit.
+    void fitWindow(const AiConfig& cfg);
+    bool compactTurn(const AiConfig& cfg, const std::string& why);
+    int outputLimit(const AiConfig& cfg) const;
+
+protected:
+    // One request with no tools: `history`, then `prompt` as a user turn,
+    // answered within `max_output_tokens`; the reply's text (its reasoning
+    // when it has none). The conversation is not changed. "": this backend
+    // cannot, and does not compact.
+    virtual std::string requestOnce(const nlohmann::json& history, const std::string& prompt,
+                                    int max_output_tokens) {
+        (void)history;
+        (void)prompt;
+        (void)max_output_tokens;
+        return {};
+    }
+    // The conversation replaced by one user message holding `text`.
+    virtual void beginWith(const std::string& text) { beginWithSummary(text); }
+
+    // fitWindow's: the next request's reply limit when cut (0: the
+    // configured one); the history's size (tapto::history_chars) when the
+    // last request was sent, which m_lastInputTokens measured.
+    int m_requestOutputLimit = 0;
+    std::size_t m_sentChars = 0;
+    bool m_compacting = false;
 
 private:
     // Tool-result payloads longer than this many characters are replaced by a

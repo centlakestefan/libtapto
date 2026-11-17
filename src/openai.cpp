@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "tapto/base64.h"
+#include "tapto/compact.h"
 #include "tapto/encoding.h"
 #include "tapto/log.h"
 #include "tapto/stream.h"
@@ -191,7 +192,7 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
     // Build request body
     json request_body = {
         {"model", m_model},
-        {"max_tokens", m_config->maxOutputTokens()},
+        {"max_tokens", outputLimit(*m_config)},
         {"messages", messages}
     };
 
@@ -572,8 +573,23 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
         });
     }
 
+    // Each request of the turn: kept within the context window, and asked
+    // again once compacted when the provider says it was over (compact.h).
+    auto send = [&]() {
+        fitWindow(*m_config);
+        try {
+            return call_openai("", tools, m_conversation_history, context.cancel);
+        } catch (const std::runtime_error& e) {
+            if (!tapto::is_context_overflow(e.what()) ||
+                !compactTurn(*m_config, std::string("the provider said the request was too long: ") + e.what()))
+                throw;
+            fitWindow(*m_config);
+            return call_openai("", tools, m_conversation_history, context.cancel);
+        }
+    };
+
     ui::set_status("Thinking...", 0, max_iterations);
-    json response = call_openai("", tools, m_conversation_history, context.cancel);
+    json response = send();
     if (!response.contains("choices") || response["choices"].empty()) {
         throw std::runtime_error("Invalid OpenAI response: " + response.dump());
     }
@@ -743,7 +759,7 @@ std::string OpenAIClient::chat(Context& context, const std::string& user_message
         }
 
         ui::set_status("Thinking...", iteration, max_iterations);
-        response = call_openai("", tools, m_conversation_history, context.cancel);
+        response = send();
         if (!response.contains("choices") || response["choices"].empty()) {
             throw std::runtime_error("Invalid OpenAI response: " + response.dump());
         }
@@ -840,13 +856,32 @@ json OpenAIClient::getHistory() const {
 
 /// <summary>Starts a new conversation seeded with a summary of the previous one (/compact).</summary>
 void OpenAIClient::beginWithSummary(const std::string& summaryText) {
+    beginWith("(The conversation prior to this point has been summarized for context):\n" + summaryText);
+    mclog("Started conversation seeded with summary of previous discussion");
+}
+
+void OpenAIClient::beginWith(const std::string& text) {
     resetTokenAccounting();
     m_conversation_history = json::array();
-    m_conversation_history.push_back({
-        {"role", "user"},
-        {"content", "(The conversation prior to this point has been summarized for context):\n" + summaryText}
-    });
-    mclog("Started conversation seeded with summary of previous discussion");
+    m_conversation_history.push_back({{"role", "user"}, {"content", text}});
+}
+
+std::string OpenAIClient::requestOnce(const json& history, const std::string& prompt, int max_output_tokens) {
+    if (!m_api_client) init_api_client();
+    m_requestOutputLimit = max_output_tokens;
+    json resp;
+    try {
+        resp = call_openai(prompt, json::array(), history, nullptr);
+    } catch (...) {
+        m_requestOutputLimit = 0;
+        throw;
+    }
+    m_requestOutputLimit = 0;
+    if (!resp.contains("choices") || !resp["choices"].is_array() || resp["choices"].empty()) return {};
+    const json message = resp["choices"][0].value("message", json::object());
+    std::string text = extractContent(message);
+    if (text.empty()) text = extractReasoning(message);
+    return text;
 }
 
 /// <summary>Sets the model for OpenAI client.</summary>
