@@ -58,7 +58,7 @@ std::string first_user_text(const nlohmann::json& history);
 // said what, the tools called with their arguments, and their results. A
 // summary asked for this way is one user message, whatever the dialect: no
 // tool blocks without tools, no two user turns in a row.
-std::string transcript(const nlohmann::json& history);
+std::string compact_transcript(const nlohmann::json& history);
 
 // The conversation a compaction starts again from. `task` is the first user
 // message (when that is itself an earlier compaction's, its task part);

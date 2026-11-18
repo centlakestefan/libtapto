@@ -32,12 +32,16 @@ using UsageCallback = std::function<void(const TokenUsage&)>;
 
 // A request that failed and is about to be sent again: why (the connection's
 // error, or the HTTP status), which retry this is of how many, and the wait
-// before it.
+// before it. Kept at for a time (AiConfig::setRetryForSeconds) rather than
+// counted, max_retries is 0, and retry_for says how long, elapsed_seconds how
+// long since the first failure.
 struct RetryInfo {
     std::string reason;
     int retry = 0;
     int max_retries = 0;
     int wait_seconds = 0;
+    int retry_for = 0;
+    int elapsed_seconds = 0;
 };
 
 // Called before each retry, on the thread that made the request
@@ -126,6 +130,23 @@ inline void report_retry(const RetryCallback& cb, std::string reason, int retry,
     r.retry = retry;
     r.max_retries = max_retries;
     r.wait_seconds = wait_seconds;
+    try {
+        cb(r);
+    } catch (...) {
+    }
+}
+
+// The same, of a RetryBudget's retry (tapto/retry.h).
+template <class Budget>
+inline void report_retry(const RetryCallback& cb, std::string reason, const Budget& b) {
+    if (!cb) return;
+    RetryInfo r;
+    r.reason = std::move(reason);
+    r.retry = b.retry();
+    r.max_retries = b.max_retries();
+    r.wait_seconds = b.wait_seconds();
+    r.retry_for = b.retry_for();
+    r.elapsed_seconds = b.elapsed_seconds();
     try {
         cb(r);
     } catch (...) {

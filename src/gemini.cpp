@@ -15,6 +15,7 @@
 #include "tapto/base64.h"
 #include "tapto/encoding.h"
 #include "tapto/log.h"
+#include "tapto/retry.h"
 #include "tapto/stream.h"
 #include "stream_post.h"
 #include "tapto/tool_image.h"
@@ -159,13 +160,11 @@ nlohmann::json GeminiClient::call_gemini(
 
     std::string body_str = request_body.dump();
 
-    const int max_connection_retries = 5;
-    const int max_rate_limit_retries = 10;
-    const int max_server_error_retries = 5;
-
-    int connection_retry_count = 0;
-    int rate_limit_retries = 0;
-    int server_error_retries = 0;
+    const int retry_for = m_config->retryForSeconds();
+    // waits 2, 4, 8, 16, 32 s; 5, 10, .. 300 s; 5, 10, 20, 40, 80 s (capped at 120)
+    tapto::RetryBudget connection(5, 2, 32, retry_for);
+    tapto::RetryBudget rate_limit(10, 5, 300, retry_for);
+    tapto::RetryBudget server_error(5, 5, 120, retry_for);
 
     for (;;) {
         // Use persistent SSL client for connection reuse
@@ -191,22 +190,17 @@ nlohmann::json GeminiClient::call_gemini(
                 mclog("Connection lost partway through a streamed reply: " + error_msg + "\n");
                 throw std::runtime_error("The connection was lost partway through the reply: " + error_msg);
             }
-            mclog("Connection failed (attempt " + std::to_string(connection_retry_count + 1) +
-                                  "/" + std::to_string(max_connection_retries) + "): " + error_msg + "\n");
+            mclog("Connection failed (retry " + std::to_string(connection.retry() + 1) + "): " + error_msg + "\n");
 
-            if (connection_retry_count >= max_connection_retries) {
-                throw std::runtime_error("Connection failed after " +
-                    std::to_string(max_connection_retries) + " retries: " + error_msg);
-            }
-            connection_retry_count++;
+            if (!connection.next())
+                throw std::runtime_error("Connection failed after " + connection.spent() + ": " + error_msg);
             init_api_client();
-            int wait_seconds = std::min(2 * (1 << std::min(connection_retry_count - 1, 16)), 32);
-            tapto::report_retry(m_config->retryCallback(), "connection failed: " + error_msg, connection_retry_count, max_connection_retries, wait_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
+            tapto::report_retry(m_config->retryCallback(), "connection failed: " + error_msg, connection);
+            if (!tapto::retry_wait(connection.wait_seconds(), cancel)) return acc.response(/*interrupted=*/true);
             continue;
         }
 
-        connection_retry_count = 0;
+        connection.reset();
 
         if (res->status == 200) {
             json resp;
@@ -236,14 +230,6 @@ nlohmann::json GeminiClient::call_gemini(
 
         // Rate limiting (429)
         if (res->status == 429) {
-            if (rate_limit_retries >= max_rate_limit_retries) {
-                std::ostringstream err;
-                err << "Exceeded maximum rate limit retries (" << max_rate_limit_retries << ")\n";
-                mclog(err.str());
-                throw std::runtime_error("Exceeded maximum rate limit retries");
-            }
-            rate_limit_retries++;
-
             int wait_seconds = 0;
 
             // Try to parse retry-after header with error handling
@@ -259,42 +245,30 @@ nlohmann::json GeminiClient::call_gemini(
                 }
             }
 
-            // Use exponential backoff if no valid retry-after header.
-            if (wait_seconds <= 0) {
-                wait_seconds = 5 * (1 << std::min(rate_limit_retries - 1, 16));
+            // The retry-after when there is one, else doubling waits; capped
+            // either way so a hostile/buggy retry-after can't make us sleep
+            // indefinitely.
+            if (!rate_limit.next(wait_seconds)) {
+                mclog("Exceeded maximum rate limit retries (" + rate_limit.spent() + ")\n");
+                throw std::runtime_error("Exceeded maximum rate limit retries (" + rate_limit.spent() + ")");
             }
-            // Cap whatever we got (header or backoff) so a hostile/buggy
-            // retry-after can't make us sleep indefinitely.
-            wait_seconds = std::min(wait_seconds, 300);
 
-            std::ostringstream log_msg;
-            log_msg << "Rate limited (attempt " << rate_limit_retries << "/" << max_rate_limit_retries
-                   << "). Waiting " << wait_seconds << " seconds before retry\n";
-            mclog(log_msg.str());
+            mclog("Rate limited (retry " + std::to_string(rate_limit.retry()) + "). Waiting " +
+                  std::to_string(rate_limit.wait_seconds()) + " seconds before retry\n");
 
-            tapto::report_retry(m_config->retryCallback(), "rate limited (429)", rate_limit_retries, max_rate_limit_retries, wait_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
+            tapto::report_retry(m_config->retryCallback(), "rate limited (429)", rate_limit);
+            if (!tapto::retry_wait(rate_limit.wait_seconds(), cancel)) return acc.response(/*interrupted=*/true);
             continue;
         }
 
         // Server errors (5xx) - can be retried
         if (res->status >= 500 && res->status < 600) {
-            if (server_error_retries >= max_server_error_retries) {
+            if (!server_error.next()) {
                 std::string error_detail = res->body.length() > 500 ? res->body.substr(0, 500) + "..." : res->body;
-                std::ostringstream err;
-                err << "Exceeded maximum server error retries (" << max_server_error_retries << ")\n";
-                mclog(err.str());
-
-                std::ostringstream exception_msg;
-                exception_msg << "Server error (" << res->status << ") after "
-                            << max_server_error_retries << " retries: " << error_detail;
-                throw std::runtime_error(exception_msg.str());
+                mclog("Exceeded maximum server error retries (" + server_error.spent() + ")\n");
+                throw std::runtime_error("Server error (" + std::to_string(res->status) + ") after " +
+                                         server_error.spent() + ": " + error_detail);
             }
-            server_error_retries++;
-
-            // Exponential backoff: 5, 10, 20, 40, 80 seconds (capped at 120)
-            // (shift clamped so it can't overflow if the retry limit is raised)
-            int wait_seconds = std::min(5 * (1 << std::min(server_error_retries - 1, 16)), 120);
 
             std::string error_msg;
             switch (res->status) {
@@ -305,14 +279,13 @@ nlohmann::json GeminiClient::call_gemini(
             default: error_msg = "Server Error"; break;
             }
 
-            std::ostringstream log_msg;
-            log_msg << error_msg << " (" << res->status << ") - attempt "
-                   << server_error_retries << "/" << max_server_error_retries
-                   << ". Retrying in " << wait_seconds << " seconds\n";
-            mclog(log_msg.str());
+            mclog(error_msg + " (" + std::to_string(res->status) + ") - retry " +
+                  std::to_string(server_error.retry()) + ". Retrying in " +
+                  std::to_string(server_error.wait_seconds()) + " seconds\n");
 
-            tapto::report_retry(m_config->retryCallback(), error_msg + " (" + std::to_string(res->status) + ")", server_error_retries, max_server_error_retries, wait_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
+            tapto::report_retry(m_config->retryCallback(), error_msg + " (" + std::to_string(res->status) + ")",
+                                server_error);
+            if (!tapto::retry_wait(server_error.wait_seconds(), cancel)) return acc.response(/*interrupted=*/true);
             continue;
         }
 

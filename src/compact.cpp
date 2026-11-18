@@ -122,7 +122,7 @@ std::string first_user_text(const json& history) {
     return {};
 }
 
-std::string transcript(const json& history) {
+std::string compact_transcript(const json& history) {
     std::string out;
     if (!history.is_array()) return out;
     auto said = [&](const std::string& who, const std::string& what) {
@@ -274,7 +274,7 @@ bool AiBackend::compactTurn(const AiConfig& cfg, const std::string& why, const C
     std::string summary;
     try {
         const std::string prompt = "The conversation so far:\n\n" +
-                                   tapto::transcript(buildTrimmedHistoryForSummary()) + "\n---\n\n" +
+                                   tapto::compact_transcript(buildTrimmedHistoryForSummary()) + "\n---\n\n" +
                                    tapto::kCompactPrompt;
         // its reply within what the window leaves, when it is known
         int reply = tapto::kCompactReplyTokens;

@@ -30,6 +30,7 @@ public:
     bool stream() const { return m_stream; }
     const tapto::StreamCallback& streamCallback() const { return m_streamCallback; }
     bool retryLostReply() const { return m_retryLostReply; }
+    int retryForSeconds() const { return m_retryForSeconds; }
     bool compactInTurn() const { return m_compactInTurn; }
     int contextWindow() const { return m_contextWindow; }
     const tapto::CompactCallback& compactCallback() const { return m_compactCallback; }
@@ -53,6 +54,7 @@ public:
     void setStream(bool v) { m_stream = v; }
     void setStreamCallback(tapto::StreamCallback v) { m_streamCallback = std::move(v); }
     void setRetryLostReply(bool v) { m_retryLostReply = v; }
+    void setRetryForSeconds(int v) { m_retryForSeconds = v; }
     void setCompactInTurn(bool v) { m_compactInTurn = v; }
     void setContextWindow(int v) { m_contextWindow = v; }
     void setCompactCallback(tapto::CompactCallback v) { m_compactCallback = std::move(v); }
@@ -133,6 +135,15 @@ private:
     // reply a second time, and a different one. A program whose replies
     // nobody watches as they come (a server's agents) turns it on.
     bool m_retryLostReply = false;
+
+    // How long a request keeps being sent again after its connection failed,
+    // the server answered with an error (5xx) or said slow down (429),
+    // counted from the first failure (tapto/retry.h). 0: a count instead,
+    // 5 retries (10 for 429) whose doubling waits add up to about a minute,
+    // which a server restarting or a network switch's upgrade outlasts. A
+    // program whose requests nobody waits on (a server's agents) sets it
+    // long. The waits stop at a cancel either way.
+    int m_retryForSeconds = 0;
 
     // Compaction inside a turn (tapto/compact.h): chat() summarizes the
     // conversation and goes on from the summary when the next request would

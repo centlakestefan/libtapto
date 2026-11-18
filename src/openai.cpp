@@ -18,6 +18,7 @@
 #include "tapto/compact.h"
 #include "tapto/encoding.h"
 #include "tapto/log.h"
+#include "tapto/retry.h"
 #include "tapto/stream.h"
 #include "stream_post.h"
 #include "tapto/tool_image.h"
@@ -241,9 +242,11 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
     };
     if (!m_config->userAgent().empty()) headers.emplace("User-Agent", m_config->userAgent());
 
-    int connection_retry_count = 0;
-    int rate_limit_retries = 0;
-    int server_error_retries = 0;
+    const int retry_for = m_config->retryForSeconds();
+    tapto::RetryBudget connection(MAX_CONNECTION_RETRIES, CONNECTION_BACKOFF_BASE, CONNECTION_BACKOFF_MAX, retry_for);
+    tapto::RetryBudget rate_limit(MAX_RATE_LIMIT_RETRIES, RATE_LIMIT_BACKOFF_BASE, RATE_LIMIT_BACKOFF_MAX, retry_for);
+    tapto::RetryBudget server_error(MAX_SERVER_ERROR_RETRIES, SERVER_ERROR_BACKOFF_BASE, SERVER_ERROR_BACKOFF_MAX,
+                                    retry_for);
 
     for (;;) {
         tapto::StreamOutcome streamed;
@@ -270,41 +273,26 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                 throw std::runtime_error("The connection was lost partway through the reply: " + error_msg);
             }
 
-            std::ostringstream log_msg;
-            log_msg << "Connection failed (attempt " << (connection_retry_count + 1)
-                   << "/" << MAX_CONNECTION_RETRIES << "): " << error_msg << "\n";
-            mclog(log_msg.str());
+            mclog("Connection failed (retry " + std::to_string(connection.retry() + 1) + "): " + error_msg + "\n");
 
-            // Check if we should retry
-            if (connection_retry_count >= MAX_CONNECTION_RETRIES) {
+            // Waits 2, 4, 8, 16, 32 seconds: five of them, or for as long as retryForSeconds
+            if (!connection.next()) {
                 mclog("Exceeded maximum connection retries\n");
-                std::ostringstream exception_msg;
-                exception_msg << "Connection failed after " << MAX_CONNECTION_RETRIES
-                            << " retries: " << error_msg;
-                throw std::runtime_error(exception_msg.str());
+                throw std::runtime_error("Connection failed after " + connection.spent() + ": " + error_msg);
             }
-
-            connection_retry_count++;
 
             // Reinitialize connection on connection failure
             mclog("Reinitializing API client connection...\n");
             init_api_client();
 
-            // Exponential backoff for connection retries: 2, 4, 8, 16, 32 seconds
-            // (shift clamped so it can't overflow if the retry limit is raised)
-            int wait_seconds = std::min(CONNECTION_BACKOFF_BASE * (1 << std::min(connection_retry_count - 1, 16)), CONNECTION_BACKOFF_MAX);
-
-            std::ostringstream retry_msg;
-            retry_msg << "Retrying in " << wait_seconds << " seconds...\n";
-            mclog(retry_msg.str());
-
-            tapto::report_retry(m_config->retryCallback(), "connection failed: " + error_msg, connection_retry_count, MAX_CONNECTION_RETRIES, wait_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
+            mclog("Retrying in " + std::to_string(connection.wait_seconds()) + " seconds...\n");
+            tapto::report_retry(m_config->retryCallback(), "connection failed: " + error_msg, connection);
+            if (!tapto::retry_wait(connection.wait_seconds(), cancel)) return acc.response(/*interrupted=*/true);
             continue;
         }
 
         // Reset connection retry counter on successful connection
-        connection_retry_count = 0;
+        connection.reset();
 
         // Handle HTTP status codes
         int status = res->status;
@@ -353,14 +341,6 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
 
         // Rate limiting (429)
         if (status == 429) {
-            if (rate_limit_retries >= MAX_RATE_LIMIT_RETRIES) {
-                std::ostringstream err;
-                err << "Exceeded maximum rate limit retries (" << MAX_RATE_LIMIT_RETRIES << ")\n";
-                mclog(err.str());
-                throw std::runtime_error("Exceeded maximum rate limit retries");
-            }
-            rate_limit_retries++;
-
             int wait_seconds = 0;
 
             // Try to parse retry-after header with error handling
@@ -376,21 +356,19 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                 }
             }
 
-            // Use exponential backoff if no valid retry-after header.
-            if (wait_seconds <= 0) {
-                wait_seconds = RATE_LIMIT_BACKOFF_BASE * (1 << std::min(rate_limit_retries - 1, 16));
+            // The retry-after when there is one, else doubling waits; capped
+            // either way so a hostile/buggy retry-after can't make us sleep
+            // indefinitely.
+            if (!rate_limit.next(wait_seconds)) {
+                mclog("Exceeded maximum rate limit retries (" + rate_limit.spent() + ")\n");
+                throw std::runtime_error("Exceeded maximum rate limit retries (" + rate_limit.spent() + ")");
             }
-            // Cap whatever we got (header or backoff) so a hostile/buggy
-            // retry-after can't make us sleep indefinitely.
-            wait_seconds = std::min(wait_seconds, RATE_LIMIT_BACKOFF_MAX);
 
-            std::ostringstream log_msg;
-            log_msg << "Rate limited (attempt " << rate_limit_retries << "/" << MAX_RATE_LIMIT_RETRIES
-                   << "). Waiting " << wait_seconds << " seconds before retry\n";
-            mclog(log_msg.str());
+            mclog("Rate limited (retry " + std::to_string(rate_limit.retry()) + "). Waiting " +
+                  std::to_string(rate_limit.wait_seconds()) + " seconds before retry\n");
 
-            tapto::report_retry(m_config->retryCallback(), "rate limited (429)", rate_limit_retries, MAX_RATE_LIMIT_RETRIES, wait_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
+            tapto::report_retry(m_config->retryCallback(), "rate limited (429)", rate_limit);
+            if (!tapto::retry_wait(rate_limit.wait_seconds(), cancel)) return acc.response(/*interrupted=*/true);
             continue;
         }
 
@@ -462,19 +440,6 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                 }
             }
 
-            if (server_error_retries >= MAX_SERVER_ERROR_RETRIES) {
-                std::string error_detail = res->body.length() > 500 ? res->body.substr(0, 500) + "..." : res->body;
-                std::ostringstream err;
-                err << "Exceeded maximum server error retries (" << MAX_SERVER_ERROR_RETRIES << ")\n";
-                mclog(err.str());
-
-                std::ostringstream exception_msg;
-                exception_msg << "Server error (" << status << ") after "
-                            << MAX_SERVER_ERROR_RETRIES << " retries: " << error_detail;
-                throw std::runtime_error(exception_msg.str());
-            }
-            server_error_retries++;
-
             int wait_seconds = 0;
 
             // For 503 Service Unavailable, respect retry-after header
@@ -490,12 +455,14 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
                 }
             }
 
-            // Use exponential backoff if no retry-after header.
-            if (wait_seconds <= 0) {
-                wait_seconds = SERVER_ERROR_BACKOFF_BASE * (1 << std::min(server_error_retries - 1, 16));
+            // The retry-after when there is one, else doubling waits; capped
+            // either way against a hostile retry-after.
+            if (!server_error.next(wait_seconds)) {
+                std::string error_detail = res->body.length() > 500 ? res->body.substr(0, 500) + "..." : res->body;
+                mclog("Exceeded maximum server error retries (" + server_error.spent() + ")\n");
+                throw std::runtime_error("Server error (" + std::to_string(status) + ") after " +
+                                         server_error.spent() + ": " + error_detail);
             }
-            // Cap whatever we got (header or backoff) against a hostile retry-after.
-            wait_seconds = std::min(wait_seconds, SERVER_ERROR_BACKOFF_MAX);
 
             std::string error_msg;
             switch (status) {
@@ -506,14 +473,12 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
             default: error_msg = "Server Error"; break;
             }
 
-            std::ostringstream log_msg;
-            log_msg << error_msg << " (" << status << ") - attempt "
-                   << server_error_retries << "/" << MAX_SERVER_ERROR_RETRIES
-                   << ". Retrying in " << wait_seconds << " seconds\n";
-            mclog(log_msg.str());
+            mclog(error_msg + " (" + std::to_string(status) + ") - retry " + std::to_string(server_error.retry()) +
+                  ". Retrying in " + std::to_string(server_error.wait_seconds()) + " seconds\n");
 
-            tapto::report_retry(m_config->retryCallback(), error_msg + " (" + std::to_string(status) + ")", server_error_retries, MAX_SERVER_ERROR_RETRIES, wait_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(wait_seconds));
+            tapto::report_retry(m_config->retryCallback(), error_msg + " (" + std::to_string(status) + ")",
+                                server_error);
+            if (!tapto::retry_wait(server_error.wait_seconds(), cancel)) return acc.response(/*interrupted=*/true);
             continue;
         }
 

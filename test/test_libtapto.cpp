@@ -7,6 +7,7 @@
 // clients send, checked against a local server. Plain assertions; ctest runs
 // the binary.
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -50,6 +51,7 @@
 #include "tapto/overflow.h"
 #include "tapto/policy.h"
 #include "tapto/provider.h"
+#include "tapto/retry.h"
 #include "tapto/secret.h"
 #include "tapto/tool_image.h"
 #include "tapto/tool_registry.h"
@@ -1489,7 +1491,7 @@ void test_compact_helpers() {
     CHECK(!tapto::is_context_overflow("Server error (500) after 5 retries: the context length was fine"));
 
     // a transcript of any dialect: who said what, the calls and their results
-    const std::string t = tapto::transcript(json::array(
+    const std::string t = tapto::compact_transcript(json::array(
         {{{"role", "user"}, {"content", "Do it."}},
          {{"role", "assistant"},
           {"content", nullptr},
@@ -1929,6 +1931,144 @@ void test_compact_reply_cut() {
     }
     server.stop();
     listener.join();
+}
+
+// A RetryBudget: counted, the doubling waits and the cap; kept at for a
+// time, given up when the time has passed, its last wait not past it.
+void test_retry_budget() {
+    tapto::RetryBudget counted(5, 2, 32);
+    std::vector<int> waits;
+    while (counted.next()) waits.push_back(counted.wait_seconds());
+    CHECK(waits == std::vector<int>({2, 4, 8, 16, 32}));
+    CHECK_EQ(counted.max_retries(), 5);
+    CHECK_EQ(counted.spent(), std::string("5 retries"));
+    counted.reset();
+    CHECK(counted.next());
+    CHECK_EQ(counted.retry(), 1);
+
+    tapto::RetryBudget hinted(10, 5, 300);
+    CHECK(hinted.next(1000));
+    CHECK_EQ(hinted.wait_seconds(), 300); // a hostile retry-after, capped
+
+    tapto::RetryBudget timed(5, 2, 32, 1);
+    CHECK_EQ(timed.max_retries(), 0);
+    CHECK(timed.next());
+    CHECK_EQ(timed.wait_seconds(), 1); // not past the second it has
+    CHECK(tapto::retry_wait(timed.wait_seconds(), nullptr));
+    CHECK(!timed.next());
+    CHECK(timed.spent().find("1 retry in ") == 0);
+
+    CancellationToken stop;
+    stop.setCheckFn([] { return true; });
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(!tapto::retry_wait(30, &stop));
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+}
+
+// The AI server gone for longer than five retries' minute (race C3, a
+// switch's software upgrade: 3.5 minutes, three tasks failed): with
+// retryForSeconds the request waits it out and the turn goes on; a stop
+// during a wait ends the turn at once, not failed; the time spent, the
+// request fails saying how long it tried.
+void test_retry_waits_out_outage() {
+    // a port with nobody on it, yet (httplib's bind listens too, and only a
+    // stop closes the socket, so it is run and stopped)
+    int port = 0;
+    {
+        httplib::Server probe;
+        port = probe.bind_to_any_port("127.0.0.1");
+        if (port > 0) {
+            std::thread run([&] { probe.listen_after_bind(); });
+            probe.wait_until_ready();
+            probe.stop();
+            run.join();
+        }
+    }
+    CHECK(port > 0);
+    if (port <= 0) return;
+    const std::string url = "http://127.0.0.1:" + std::to_string(port);
+    auto done = [](const httplib::Request&, httplib::Response& res) {
+        json message = {{"role", "assistant"}, {"content", "Done."}};
+        res.set_content(json{{"choices", json::array({{{"message", message}, {"finish_reason", "stop"}}})}}.dump(),
+                        "application/json");
+    };
+
+    {
+        // back after 3 s: a retry after it gets through
+        AiConfig cfg;
+        cfg.setRetryForSeconds(60);
+        std::vector<tapto::RetryInfo> told;
+        cfg.setRetryCallback([&](const tapto::RetryInfo& r) { told.push_back(r); });
+        httplib::Server server;
+        server.Post("/v1/chat/completions", done);
+        std::atomic<bool> bound{false};
+        std::thread later([&] {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (server.bind_to_port("127.0.0.1", port)) {
+                bound = true;
+                server.listen_after_bind();
+            }
+        });
+        OpenAIClient client(&cfg, url, "m", "k");
+        client.start();
+        Context ctx;
+        std::string reply, error;
+        try {
+            reply = client.chat(ctx, "Hello.");
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        CHECK_EQ(error, std::string());
+        CHECK_EQ(reply, std::string("Done."));
+        CHECK(!told.empty()); // a refused connect takes 2 s on Windows: one wait or two
+        if (!told.empty()) {
+            CHECK_EQ(told[0].max_retries, 0);
+            CHECK_EQ(told[0].retry_for, 60);
+            CHECK(told[0].reason.find("connection failed") == 0);
+        }
+        // the chat outlasts the 3 s, so the port was bound (or failed to be) by now
+        if (bound) {
+            server.wait_until_ready();
+            server.stop();
+        }
+        later.join();
+    }
+    {
+        // stopped while it waits: the turn ends now, nothing thrown
+        AiConfig cfg;
+        cfg.setRetryForSeconds(600);
+        OpenAIClient client(&cfg, url, "m", "k");
+        client.start();
+        const auto t0 = std::chrono::steady_clock::now();
+        CancellationToken token;
+        token.setCheckFn([&] { return std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500); });
+        Context ctx;
+        ctx.cancel = &token;
+        std::string error;
+        try {
+            client.chat(ctx, "Hello.");
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        CHECK_EQ(error, std::string());
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(4));
+    }
+    {
+        // the time spent: failed, saying how long
+        AiConfig cfg;
+        cfg.setRetryForSeconds(3);
+        ClaudeClient client(&cfg, url, "m", "k");
+        client.start();
+        Context ctx;
+        std::string error;
+        try {
+            client.chat(ctx, "Hello.");
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        CHECK(error.find("Connection failed after ") == 0);
+        CHECK(error.find(" in ") != std::string::npos && error.find(" s: ") != std::string::npos);
+    }
 }
 
 // A reply cut off at the output limit partway through a tool call's
@@ -3072,6 +3212,8 @@ int main() {
     test_compact_guard_and_stop();
     test_stop_after_tool_answered_once();
     test_compact_reply_cut();
+    test_retry_budget();
+    test_retry_waits_out_outage();
     test_openai_cut_off_tool_call();
     test_openai_lost_stream_retried();
     test_openai_streamed_chat();
