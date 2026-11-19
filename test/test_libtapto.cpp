@@ -1528,6 +1528,12 @@ void test_compact_helpers() {
           {"content", json::array({{{"type", "image_url"},
                                     {"image_url", {{"url", "data:image/png;base64," + std::string(500000, 'A')}}}}})}}});
     CHECK(tapto::history_chars(with_image) < 10000);
+
+    // an openai message's chain of thought is kept, not sent: not counted
+    const json plain = json::array({{{"role", "assistant"}, {"content", "ok"}}});
+    const json thought = json::array(
+        {{{"role", "assistant"}, {"content", "ok"}, {"reasoning_content", std::string(50000, 'r')}}});
+    CHECK_EQ(tapto::history_chars(thought), tapto::history_chars(plain));
 }
 
 // A long turn against a server whose window it outgrows: compacted before the
@@ -2319,13 +2325,21 @@ void test_openai_streamed_chat() {
         CHECK_EQ(told[0].input, std::uint64_t(7));
         CHECK_EQ(told[1].output, std::uint64_t(2));
     }
-    // The history holds the call whole, as the next request sends it.
+    // The history holds the call whole, as the next request sends it, and
+    // the chain of thought, which no request sends.
     const json history = client.getHistory();
     CHECK(history.size() >= 2);
     if (history.size() >= 2) {
         CHECK_EQ(history[1]["tool_calls"][0]["function"]["arguments"].get<std::string>(),
                  std::string("{\"s\":\"hi\"}"));
-        CHECK(!history[1].contains("reasoning_content"));
+        CHECK_EQ(history[1].value("reasoning_content", std::string()), std::string("Need the tool."));
+    }
+    if (requests.size() == 2) {
+        bool sent = false;
+        for (const json& m : requests[1]["messages"])
+            sent = sent || m.contains("reasoning_content") || m.contains("reasoning");
+        CHECK(!sent);
+        CHECK(requests[1]["messages"].dump().find("tool_calls") != std::string::npos);
     }
 
     // A server that answers whole although asked for a stream: shown whole.

@@ -101,20 +101,16 @@ std::string extractContent(const json& message) {
     return stripChannelTokens(message["content"].get<std::string>());
 }
 
-/// <summary>Strip per-turn-only fields from an assistant message before
-/// echoing it back to the server in conversation history. `reasoning_content`
-/// is chain-of-thought scratch that some providers (DeepSeek's hosted API)
-/// reject when sent back, and all providers waste tokens reading it.
-/// A tool call whose arguments are not a JSON object (a reply cut off at the
+/// <summary>An assistant message as the conversation history keeps it. Its
+/// chain of thought (`reasoning_content`) stays, so a program can show it
+/// later (a /cot turned on, a resumed conversation); call_openai leaves it out
+/// of every request (forRequest). A tool call whose arguments are not a JSON object (a reply cut off at the
 /// output limit partway through them) is sent back with `{}`: llama.cpp
 /// parses every call's arguments in the history to render its chat template
 /// and refuses the whole request otherwise (HTTP 500, "Failed to parse tool
 /// call arguments as JSON"), every retry alike. The tool result says what
 /// went wrong.</summary>
 json historyMessage(json message) {
-    for (const char* field : kReasoningFields) {
-        message.erase(field);
-    }
     if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
         for (json& call : message["tool_calls"]) {
             if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
@@ -128,6 +124,19 @@ json historyMessage(json message) {
         }
     }
     return message;
+}
+
+/// <summary>A history message as it is sent: without its chain of thought,
+/// which some providers (DeepSeek's hosted API) refuse when it is sent back
+/// and all of them would waste tokens reading.</summary>
+json forRequest(const json& message) {
+    if (!message.is_object()) return message;
+    bool has = false;
+    for (const char* field : kReasoningFields) has = has || message.contains(field);
+    if (!has) return message;
+    json out = message;
+    for (const char* field : kReasoningFields) out.erase(field);
+    return out;
 }
 
 } // namespace
@@ -178,9 +187,9 @@ json OpenAIClient::call_openai(const std::string& user_message, const json& tool
         });
     }
 
-    // Add conversation history
+    // Add conversation history, its chain of thought left out
     for (const auto& msg : conversation_history) {
-        messages.push_back(msg);
+        messages.push_back(forRequest(msg));
     }
 
     // Add new user message if provided

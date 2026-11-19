@@ -127,10 +127,13 @@ json ClaudeClient::call_claude(const std::string& user_message, const json& tool
     // exactly 0 is the one way to say "off".
     //
     // display: thinking text is omitted by default on current models, so a
-    // client that wants to show reasoning has to ask for a summary.
+    // client that wants to show reasoning has to ask for a summary. Asked for
+    // whether or not it is shown now: the history keeps it, so a program can
+    // show it later (a /cot turned on, a resumed conversation). The thinking
+    // is billed the same either way.
     if (!m_thinkingBudget.has_value() || m_thinkingBudget.value() != 0) {
         json thinking = {{"type", "adaptive"}};
-        if (m_config->printCot()) thinking["display"] = "summarized";
+        thinking["display"] = "summarized";
         request_body["thinking"] = thinking;
     }
 

@@ -50,7 +50,12 @@ std::size_t chars_of(const json& j) {
         // Claude's {"type":"base64","data":...}, Gemini's inlineData
         if (j.contains("data") && (j.value("type", std::string()) == "base64" || j.contains("mimeType")))
             return kImageChars;
-        for (const auto& [k, v] : j.items()) n += k.size() + chars_of(v);
+        for (const auto& [k, v] : j.items()) {
+            // an openai message's chain of thought: kept in the history, never
+            // sent (OpenAIClient's forRequest)
+            if (k == "reasoning_content" || k == "reasoning") continue;
+            n += k.size() + chars_of(v);
+        }
     } else if (j.is_array()) {
         for (const auto& v : j) n += chars_of(v);
     } else {
