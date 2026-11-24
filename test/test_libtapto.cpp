@@ -8,6 +8,7 @@
 // the binary.
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -3028,6 +3029,43 @@ void test_command_tools() {
         // A %p path outside the folders is refused before anything runs.
         r = cmd({{"name", "grep-in"}, {"args", {"../other/secret.txt"}}});
         CHECK(starts_with(r, "ERROR:") && !contains(r, "exit code"));
+
+        // ESC while a command runs: the turn's token is cancelled from
+        // another thread (a program's keyboard watcher), and the command is
+        // stopped with what it started, not waited out. The model is told.
+#ifdef _WIN32
+        tapto::add_command(tapto::Level::Global, "slow", "ping -n 30 127.0.0.1");
+#else
+        tapto::add_command(tapto::Level::Global, "slow", "sleep 30");
+#endif
+        CancellationToken token;
+        Context ctx;
+        ctx.cancel = &token;
+        std::thread esc([&token] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            for (int i = 0; i < 100 && !token.cancelled(); ++i) {
+                token.cancel();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            token.cancel(); // once more, as the watcher keeps doing
+        });
+        const auto start = std::chrono::steady_clock::now();
+        for (const auto& tool : tools)
+            if (tool.name == "run_command") r = tool.executor(ctx, json{{"name", "slow"}});
+        const auto took = std::chrono::steady_clock::now() - start;
+        esc.join();
+        CHECK(contains(r, "[interrupted by the user"));
+        CHECK(took < std::chrono::seconds(10)); // not the command's 30 s
+
+        // A hook registered on a token already cancelled runs at once, and
+        // none runs after its own end.
+        int runs = 0;
+        {
+            const CancellationToken::AbortHook hook(&token, [&runs] { ++runs; });
+            CHECK_EQ(runs, 1);
+        }
+        token.cancel();
+        CHECK_EQ(runs, 1);
     }
 
     env(home_var, old_home);

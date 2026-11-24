@@ -513,7 +513,11 @@ std::string ClaudeClient::chat(Context& context, const std::string& user_message
 
                 std::string result;
                 auto it = m_tool_registry.find(tool_name);
-                if (it != m_tool_registry.end()) {
+                if (context.cancel && context.cancel->check()) {
+                    // Stopped during an earlier call of this batch: the rest
+                    // are answered, not run.
+                    result = "Tool not run: the turn was stopped before it ran (interrupted).";
+                } else if (it != m_tool_registry.end()) {
                     try {
                         result = it->second(tool_input);
                     }

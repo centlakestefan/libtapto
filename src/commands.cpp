@@ -4,13 +4,16 @@
 #include "tapto/commands.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,6 +24,8 @@
 #  define NOMINMAX
 #  include <windows.h>
 #else
+#  include <fcntl.h>
+#  include <signal.h>
 #  include <unistd.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
@@ -234,6 +239,15 @@ bool remove_command(Level level, const std::string& name) {
 // --- the command tools ----------------------------------------------------
 
 namespace {
+
+// The command running now, for stop_running_command(): the job holding it and
+// what it started (Windows), or its process group (elsewhere). Null / 0 when
+// none runs.
+#ifdef _WIN32
+std::atomic<HANDLE> g_running_job{nullptr};
+#else
+std::atomic<pid_t> g_running_group{0};
+#endif
 
 // True if `path` is `root` or under it, both already canonical.
 bool is_under(const fs::path& root, const fs::path& path) {
@@ -770,9 +784,12 @@ std::vector<wchar_t> child_environment(const PathRules& rules) {
 
 // Start `app` with `cmdline`, capturing stdout+stderr. On success returns true
 // and fills out/code; if the process couldn't be started returns false and
-// sets err.
+// sets err. Cancelling `cancel` stops the process and all it started, and
+// sets `interrupted`.
 bool win_launch(const PathRules& rules, const std::wstring& app, const std::wstring& cmdline, const std::wstring& cwd,
-                std::string& out, int& code, DWORD& err) {
+                const CancellationToken* cancel, std::string& out, int& code, bool& interrupted,
+                DWORD& err) {
+    interrupted = false;
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
@@ -780,10 +797,15 @@ bool win_launch(const PathRules& rules, const std::wstring& app, const std::wstr
     if (!CreatePipe(&rd, &wr, &sa, 0)) { err = GetLastError(); return false; }
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 
+    // Nothing to read: a command runs unattended, so one that asked for input
+    // would wait for good, and the console's keys (ESC) are the program's.
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                             OPEN_EXISTING, 0, nullptr);
+
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = nul != INVALID_HANDLE_VALUE ? nul : GetStdHandle(STD_INPUT_HANDLE);
     si.hStdOutput = wr;
     si.hStdError = wr;
     PROCESS_INFORMATION pi{};
@@ -792,37 +814,68 @@ bool win_launch(const PathRules& rules, const std::wstring& app, const std::wstr
     buf.push_back(L'\0');
     std::vector<wchar_t> env = child_environment(rules);
 
+    // A job holds the command and whatever it starts (a build's compilers),
+    // so all of them stop together. The process starts suspended and joins
+    // the job before it runs, so nothing it starts is left outside.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+
     // `app` is an absolute path, so CreateProcess runs exactly that file and
     // searches nowhere.
     BOOL ok = CreateProcessW(app.c_str(), buf.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, env.data(),
-                             cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
-    if (!ok) { err = GetLastError(); CloseHandle(wr); CloseHandle(rd); return false; }
+                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                             env.data(), cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    if (!ok) {
+        err = GetLastError();
+        CloseHandle(wr);
+        CloseHandle(rd);
+        if (job) CloseHandle(job);
+        return false;
+    }
+    // Outside a job, only the process itself can be stopped.
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        CloseHandle(job);
+        job = nullptr;
+    }
+    ResumeThread(pi.hThread);
     CloseHandle(wr);
+    g_running_job.store(job);
 
     out.clear();
-    char chunk[4096];
-    DWORD n = 0;
-    while (ReadFile(rd, chunk, sizeof(chunk), &n, nullptr) && n > 0) out.append(chunk, n);
+    {
+        HANDLE process = pi.hProcess;
+        const CancellationToken::AbortHook stop_on_cancel(cancel, [job, process] {
+            if (job) TerminateJobObject(job, 1);
+            else TerminateProcess(process, 1);
+        });
+        char chunk[4096];
+        DWORD n = 0;
+        while (ReadFile(rd, chunk, sizeof(chunk), &n, nullptr) && n > 0) out.append(chunk, n);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    }
+    g_running_job.store(nullptr);
+    interrupted = cancel && cancel->cancelled();
     CloseHandle(rd);
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD c = 0;
     GetExitCodeProcess(pi.hProcess, &c);
     code = static_cast<int>(c);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (job) CloseHandle(job);
     return true;
 }
 
 // Run argv (no shell, unless the program is a script) and capture
 // stdout+stderr. `started` is false when it never ran -- not found, refused,
 // or not startable -- and the result is then the program's error message.
+// Cancelling `cancel` stops the command, and sets `interrupted`.
 std::string exec_capture(const PathRules& rules, const std::vector<std::string>& argv,
-                         const fs::path& cwd, int& exit_code,
-                         bool& started) {
+                         const fs::path& cwd, const CancellationToken* cancel, int& exit_code,
+                         bool& started, bool& interrupted) {
     exit_code = -1;
     started = false;
+    interrupted = false;
     Program prog;
     std::string error;
     if (!find_program(rules, argv[0], cwd, prog, error)) return error;
@@ -866,7 +919,8 @@ std::string exec_capture(const PathRules& rules, const std::vector<std::string>&
 
     std::string out;
     DWORD err = 0;
-    if (win_launch(rules, app, cmdline, utf8_to_wide(cwd.u8string()), out, exit_code, err)) {
+    if (win_launch(rules, app, cmdline, utf8_to_wide(cwd.u8string()), cancel, out, exit_code,
+                   interrupted, err)) {
         started = true;
         return out;
     }
@@ -876,14 +930,15 @@ std::string exec_capture(const PathRules& rules, const std::vector<std::string>&
 }
 #else
 // Run argv (no shell, unless the program is a script without the execute
-// bit) and capture stdout+stderr; `started` as on Windows. The child
-// chdir's to `cwd` (inside the sandbox) before exec, so the parent's working
-// directory is never touched.
+// bit) and capture stdout+stderr; `started` and `interrupted` as on Windows.
+// The child chdir's to `cwd` (inside the sandbox) before exec, so the
+// parent's working directory is never touched.
 std::string exec_capture(const PathRules& rules, const std::vector<std::string>& argv,
-                         const fs::path& cwd, int& exit_code,
-                         bool& started) {
+                         const fs::path& cwd, const CancellationToken* cancel, int& exit_code,
+                         bool& started, bool& interrupted) {
     exit_code = -1;
     started = false;
+    interrupted = false;
     Program prog;
     std::string error;
     if (!find_program(rules, argv[0], cwd, prog, error)) return error;
@@ -914,6 +969,15 @@ std::string exec_capture(const PathRules& rules, const std::vector<std::string>&
     pid_t pid = fork();
     if (pid < 0) { close(fds[0]); close(fds[1]); return "ERROR: fork failed"; }
     if (pid == 0) {
+        // A process group of its own, so the command stops together with what
+        // it started (a build's compilers), and nothing to read: a command
+        // runs unattended, and the terminal's keys (ESC) are the program's.
+        setpgid(0, 0);
+        const int nul = open("/dev/null", O_RDONLY);
+        if (nul >= 0 && nul != STDIN_FILENO) {
+            dup2(nul, STDIN_FILENO);
+            close(nul);
+        }
         dup2(fds[1], STDOUT_FILENO);
         dup2(fds[1], STDERR_FILENO);
         close(fds[0]);
@@ -928,15 +992,41 @@ std::string exec_capture(const PathRules& rules, const std::vector<std::string>&
         (void)!write(STDOUT_FILENO, msg, sizeof(msg) - 1);
         _exit(127);
     }
+    // In the parent as well: whichever runs first, the group exists before
+    // anything signals it.
+    setpgid(pid, pid);
     close(fds[1]);
     started = true;
+    g_running_group.store(pid);
     std::string out;
-    char chunk[4096];
-    ssize_t n;
-    while ((n = read(fds[0], chunk, sizeof(chunk))) > 0) out.append(chunk, static_cast<size_t>(n));
-    close(fds[0]);
     int status = 0;
-    waitpid(pid, &status, 0);
+    {
+        // SIGINT first, as Ctrl-C would send it, so a build can clean up after
+        // itself; SIGKILL if the group is still there 3 s later, when cancel()
+        // is called again.
+        struct Stop {
+            bool asked = false;
+            std::chrono::steady_clock::time_point when;
+        };
+        auto stop = std::make_shared<Stop>();
+        const CancellationToken::AbortHook stop_on_cancel(cancel, [pid, stop] {
+            const auto now = std::chrono::steady_clock::now();
+            if (!stop->asked) {
+                kill(-pid, SIGINT);
+                stop->asked = true;
+                stop->when = now;
+            } else if (now - stop->when > std::chrono::seconds(3)) {
+                kill(-pid, SIGKILL);
+            }
+        });
+        char chunk[4096];
+        ssize_t n;
+        while ((n = read(fds[0], chunk, sizeof(chunk))) > 0) out.append(chunk, static_cast<size_t>(n));
+        waitpid(pid, &status, 0);
+    }
+    g_running_group.store(0);
+    interrupted = cancel && cancel->cancelled();
+    close(fds[0]);
     exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return out;
 }
@@ -1236,7 +1326,8 @@ std::string execute_list_commands(Context& /*context*/, const json& /*in*/) {
     return out.str();
 }
 
-std::string execute_run_command(const PathRules& rules, const json& in) {
+std::string execute_run_command(const PathRules& rules, const json& in,
+                                const CancellationToken* cancel) {
     try {
         if (!in.contains("name")) return "ERROR: 'name' not present.";
         std::string name = in["name"].get<std::string>();
@@ -1329,8 +1420,9 @@ std::string execute_run_command(const PathRules& rules, const json& in) {
         }
         int exit_code = 0;
         bool started = false;
+        bool interrupted = false;
         const std::string display = join_argv(argv);
-        std::string output = exec_capture(rules, argv, base, exit_code, started);
+        std::string output = exec_capture(rules, argv, base, cancel, exit_code, started, interrupted);
         // Not found, refused or not startable: an error of the program's own,
         // not output of the program.
         if (!started) return output;
@@ -1345,6 +1437,9 @@ std::string execute_run_command(const PathRules& rules, const json& in) {
         }
         r << "$ " << display << "\n" << output;
         if (!output.empty() && output.back() != '\n') r << "\n";
+        // The model sees this on the next turn: the output is cut short, and
+        // the command did not finish its work.
+        if (interrupted) r << "[interrupted by the user: the command was stopped before it finished]\n";
         r << "[exit code: " << exit_code << "]";
         return r.str();
     } catch (const std::exception& e) {
@@ -1383,6 +1478,14 @@ std::string display_run_command(const json& input) {
 }
 
 } // namespace
+
+void stop_running_command() {
+#ifdef _WIN32
+    if (HANDLE job = g_running_job.load()) TerminateJobObject(job, 1);
+#else
+    if (const pid_t group = g_running_group.load()) kill(-group, SIGTERM);
+#endif
+}
 
 bool is_builtin_command(const std::string& name) {
     return name == "wc" || name == "head" || name == "tail" ||
@@ -1448,7 +1551,9 @@ std::vector<ToolSpec> command_tools(const FolderSet& folders) {
         }},
         {"required", {"name"}},
     };
-    run.executor = [rules](Context&, const json& in) { return execute_run_command(rules, in); };
+    run.executor = [rules](Context& context, const json& in) {
+        return execute_run_command(rules, in, context.cancel);
+    };
     run.display = display_run_command;
     tools.push_back(std::move(run));
 

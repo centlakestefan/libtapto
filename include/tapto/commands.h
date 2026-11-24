@@ -34,6 +34,15 @@ std::vector<ToolSpec> command_tools(const FolderSet& folders);
 // take.
 bool is_builtin_command(const std::string& name);
 
+// Stop the command run_command is running, with whatever it started (a
+// build's compilers), for a program that is about to end: Ctrl-C does not
+// reach a command, which runs without the console (Windows) or in a process
+// group of its own (elsewhere), so it would otherwise go on alone. Safe in a
+// signal handler and a console control handler. ESC during a turn does not
+// need it: run_command stops its command when the context's cancellation
+// token is cancelled (tapto/cancel.h).
+void stop_running_command();
+
 // A user-defined, allow-listed command: a short name mapped to a command line,
 // plus the scope it came from.
 struct CommandEntry {
