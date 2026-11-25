@@ -670,6 +670,7 @@ struct Plugins::Loaded {
     scom::QIPtr<ITaptoPluginTools> tool_list; // tools known once configured
     scom::QIPtr<ITaptoPluginCommands> command; // its /<name>, when it declares one
     scom::QIPtr<ITaptoPluginEvents> event_sink; // its events, when it subscribed to any
+    scom::QIPtr<ITaptoPluginStatus> status_line; // its status-line text, when it has one
     std::set<std::string> events;               // those it subscribed to
     std::string command_usage;
     std::string command_description;
@@ -688,6 +689,7 @@ struct Plugins::Loaded {
             tool_list.Release();
             command.Release();
             event_sink.Release();
+            status_line.Release();
             plugin.Release();
         }
         // Without the exports nothing of it was ever called, so it can go.
@@ -1082,6 +1084,7 @@ std::string attach(Plugins::Loaded& p, bool check_name, bool configure = true,
         return why;
     }
     p.prompt = scom::QIPtr<ITaptoPluginPrompt>(p.plugin.get());
+    p.status_line = scom::QIPtr<ITaptoPluginStatus>(p.plugin.get());
     if (!p.events.empty()) {
         p.event_sink = scom::QIPtr<ITaptoPluginEvents>(p.plugin.get());
         if (!p.event_sink) {
@@ -1289,6 +1292,51 @@ std::string Plugins::prompt() const {
                 text += (text.empty() ? "" : "\n\n") + changing.str();
         }
         if (!text.empty()) out += (out.empty() ? "" : "\n\n") + text;
+    }
+    return out;
+}
+
+std::string Plugins::status(const std::string& json_context) const {
+    constexpr std::size_t kMaxBytes = 80;
+    std::string out;
+    for (const auto& l : m_loaded) {
+        if (!l->status_line) continue;
+        TaptoString text;
+        SRESULT r = scom::ERR_BAD_OBJECT;
+        try {
+            r = l->status_line->Status(json_context.c_str(), text.out());
+        } catch (...) {
+            mclog("[plugins] " + l->name + ": an exception escaped its Status\n");
+        }
+        if (r != scom::OK || text.empty()) continue;
+        // One row of plain text: a plugin's escapes or line breaks would
+        // tear the host's status line.
+        // Escape sequences go whole (ESC [ ... final byte), any other control
+        // character becomes a space.
+        const std::string raw = text.str();
+        std::string line;
+        for (std::size_t i = 0; i < raw.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(raw[i]);
+            if (c == 0x1b) {
+                if (i + 1 < raw.size() && raw[i + 1] == '[') {
+                    i += 2;
+                    while (i < raw.size() && !(raw[i] >= 0x40 && raw[i] <= 0x7e)) ++i;
+                }
+                continue;
+            }
+            if (c < 0x20 || c == 0x7f) {
+                if (!line.empty() && line.back() != ' ') line += ' ';
+                continue;
+            }
+            line += static_cast<char>(c);
+        }
+        while (!line.empty() && line.back() == ' ') line.pop_back();
+        if (line.size() > kMaxBytes) {
+            std::size_t cut = kMaxBytes;
+            while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80) --cut;
+            line.resize(cut);
+        }
+        if (!line.empty()) out += (out.empty() ? "" : " \xC2\xB7 ") + line; // ·
     }
     return out;
 }

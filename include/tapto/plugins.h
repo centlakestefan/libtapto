@@ -179,6 +179,14 @@ public:
     // System-prompt text: each plugin's fixed prompt and its changing one.
     std::string prompt() const;
 
+    // The status-line text of the plugins that have one (ITaptoPluginStatus),
+    // joined by " · ", "" for none. `json_context` as Status takes it. For a
+    // thread of the caller's own while the model works: safe beside a tool
+    // call on the turn's thread, but not beside add() or remove(). Each
+    // plugin's text is made one row of plain text (escape sequences dropped,
+    // other control characters a space) of at most 80 bytes.
+    std::string status(const std::string& json_context) const;
+
     // True once, after a call changed a plugin's tools (an MCP server that
     // wants a login again): the caller rebuilds its tool table and prompt
     // before the next turn, since a turn keeps the tools it started with.

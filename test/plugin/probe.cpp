@@ -56,13 +56,15 @@ void release_host() {
 class Probe final : public scom::Base,
               public tapto::ITaptoPlugin,
               public tapto::ITaptoPluginUnload,
-              public tapto::ITaptoPluginPrompt {
+              public tapto::ITaptoPluginPrompt,
+              public tapto::ITaptoPluginStatus {
 public:
     SCOM_IMPLEMENT_BASE_EX(Probe, tapto::ITaptoPlugin)
     SCOM_BEGIN_INTERFACE_MAP(Probe)
         SCOM_INTERFACE(tapto::ITaptoPlugin)
         SCOM_INTERFACE(tapto::ITaptoPluginUnload)
         SCOM_INTERFACE(tapto::ITaptoPluginPrompt)
+        SCOM_INTERFACE(tapto::ITaptoPluginStatus)
     SCOM_END_INTERFACE_MAP()
 
     SRESULT SCOM_CALL Describe(char*& json_out) override {
@@ -137,6 +139,14 @@ public:
 
     SRESULT SCOM_CALL Prompt(char*& text_out) override {
         return hand_out("probe changing " + std::to_string(++m_prompts), text_out);
+    }
+
+    // The provider it was told of, with an escape and a line break the host
+    // must take out, and nothing at all for the provider "quiet".
+    SRESULT SCOM_CALL Status(const char* json_context, char*& text_out) override {
+        const std::string provider = arg(json_context ? json_context : "", "provider");
+        if (provider == "quiet") return hand_out("", text_out);
+        return hand_out("\x1b[1mprobe\x1b[0m on\n" + provider, text_out);
     }
 
 private:

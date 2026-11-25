@@ -277,6 +277,12 @@ int main(int argc, char** argv) {
         CHECK_EQ(plugins.prompt(), "probe fixed\n\nprobe changing 1");
         CHECK_EQ(plugins.prompt(), "probe fixed\n\nprobe changing 2");
 
+        // Its status-line text, told the provider: escapes taken out, a line
+        // break made a space, and nothing for none.
+        CHECK_EQ(plugins.status(R"({"provider":"qwen","provider_url":"http://x","model":"m"})"),
+                 "probe on qwen");
+        CHECK_EQ(plugins.status(R"({"provider":"quiet"})"), "");
+
         // Loading it twice is refused.
         CHECK_TRUE(!plugins.add_file(probe, false).empty());
 
@@ -285,6 +291,7 @@ int main(int argc, char** argv) {
         CHECK_TRUE(unloaded);
         CHECK_TRUE(plugins.tools().empty());
         CHECK_EQ(plugins.prompt(), "");
+        CHECK_EQ(plugins.status(R"({"provider":"qwen"})"), "");
         CHECK_TRUE(!plugins.remove("probe"));
     }
 

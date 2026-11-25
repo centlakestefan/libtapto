@@ -252,6 +252,27 @@ struct ITaptoPluginCommands : scom::IBase {
 SCOM_DEFINE_IID(ITaptoPluginCommands, 0xd2bba127, 0x9ae5, 0x4bfc, 0xb8, 0x61, 0x7b, 0xa9,
                 0xa7, 0xe4, 0x70, 0xb0)
 
+// Optional: a few words for the host's status line while the model works
+// (the model server's load, say): "27 tok/s · 1 user · cache 63%". The host
+// asks about once a second, on a thread of its own, also while one of this
+// plugin's tools runs on the turn's thread: Status must be safe beside
+// CallTool and return at once -- a plugin whose answer takes a fetch does it
+// on a thread of its own and hands back what it last got. No per-call host
+// function works in it (IsCancelled, WriteTemp, AttachImage).
+//
+// `json_context` says what the turn talks to, so the plugin can follow a
+// change of provider:
+//   {"provider": "qwen38", "provider_url": "http://gpu-box:8000",
+//    "model": "qwen3.8-flash-next"}
+// `text_out` is one line of plain text, no escapes; empty, or a status other
+// than OK, shows nothing.
+struct ITaptoPluginStatus : scom::IBase {
+    virtual SRESULT SCOM_CALL Status(const char* json_context, char*& text_out) = 0;
+};
+// {10705887-AE76-4E5A-A247-FC360EFC6596}
+SCOM_DEFINE_IID(ITaptoPluginStatus, 0x10705887, 0xae76, 0x4e5a, 0xa2, 0x47, 0xfc, 0x36, 0x0e,
+                0xfc, 0x65, 0x96)
+
 // --- The module's exports -----------------------------------------------------
 
 #if defined(_WIN32)
